@@ -1,0 +1,307 @@
+.page {
+  min-height: 100vh;
+  padding: 28px;
+  background: #f5f7f4;
+  color: #172019;
+}
+
+.toolbar {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 18px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid #d9dfd5;
+}
+
+.eyebrow {
+  margin-bottom: 6px;
+  color: #66735f;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.toolbar h1 {
+  font-size: 30px;
+  line-height: 1.2;
+}
+
+.periodControls,
+.holidayRow,
+.actions {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.periodControls input {
+  width: 96px;
+}
+
+.inputBand,
+.tableWrap,
+.failureBox,
+.statusLine,
+.statsGrid {
+  margin-top: 22px;
+}
+
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.sectionHeader h2,
+.failureBox h2 {
+  font-size: 18px;
+}
+
+.holidayRow {
+  margin-bottom: 16px;
+}
+
+.holidayRow label:first-child {
+  min-width: 280px;
+}
+
+.employeeGrid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.employeePanel,
+.statPanel,
+.failureBox {
+  border: 1px solid #d9dfd5;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.employeePanel {
+  padding: 14px;
+}
+
+.employeePanel h3,
+.statPanel h3 {
+  margin-bottom: 12px;
+  font-size: 16px;
+}
+
+.employeePanel label,
+.holidayRow label,
+.periodControls label {
+  display: grid;
+  gap: 6px;
+  color: #51604b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.employeePanel input,
+.holidayRow input,
+.periodControls input {
+  height: 38px;
+  border: 1px solid #cdd5c8;
+  border-radius: 6px;
+  padding: 0 10px;
+  background: #fff;
+  color: #172019;
+  font-size: 14px;
+}
+
+.actions {
+  margin-top: 18px;
+}
+
+.primaryButton,
+.secondaryButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 40px;
+  border-radius: 6px;
+  padding: 0 14px;
+  border: 1px solid #1f5c4b;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.primaryButton {
+  background: #1f5c4b;
+  color: #ffffff;
+}
+
+.secondaryButton {
+  background: #ffffff;
+  color: #1f5c4b;
+}
+
+.primaryButton:disabled,
+.secondaryButton:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+
+.failureBox {
+  padding: 16px;
+  border-color: #d18a7b;
+  background: #fff8f6;
+}
+
+.failureBox p,
+.warning {
+  margin-top: 8px;
+  color: #7a2f22;
+}
+
+.statusLine {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.statusLine span {
+  border: 1px solid #bdd2c1;
+  border-radius: 999px;
+  padding: 7px 10px;
+  background: #edf7ef;
+  color: #245336;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.tableWrap {
+  overflow-x: auto;
+  border: 1px solid #d9dfd5;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.scheduleTable {
+  width: 100%;
+  min-width: 860px;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.scheduleTable th,
+.scheduleTable td {
+  border-bottom: 1px solid #e5e9e1;
+  padding: 9px 10px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.scheduleTable th {
+  position: sticky;
+  top: 0;
+  background: #eef3eb;
+  color: #394536;
+  z-index: 1;
+}
+
+.scheduleTable td:nth-child(3),
+.scheduleTable th:nth-child(3) {
+  text-align: left;
+}
+
+.restDayRow {
+  background: #fbf3ef;
+}
+
+.shiftPill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 26px;
+  border-radius: 6px;
+  font-weight: 800;
+}
+
+.dayShift {
+  background: #dcebd2;
+  color: #244c1e;
+}
+
+.eveningShift {
+  background: #e4e0f4;
+  color: #3e336b;
+}
+
+.nightShift {
+  background: #d8e4ee;
+  color: #173d59;
+}
+
+.offShift {
+  background: #f0f0ec;
+  color: #6f7469;
+}
+
+.statsGrid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.statPanel {
+  padding: 14px;
+}
+
+.statPanel div {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 0;
+  border-top: 1px solid #edf0ea;
+  font-size: 13px;
+}
+
+.statPanel span {
+  color: #66735f;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 1050px) {
+  .employeeGrid,
+  .statsGrid {
+    grid-template-columns: repeat(2, minmax(210px, 1fr));
+  }
+}
+
+@media (max-width: 680px) {
+  .page {
+    padding: 18px;
+  }
+
+  .toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .employeeGrid,
+  .statsGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .primaryButton,
+  .secondaryButton {
+    width: 100%;
+  }
+}
