@@ -238,6 +238,7 @@ function fillRequests(schedule: Schedule, parsed: ParsedEmployeeInput[], slots: 
 function buildInitialLockedOff(parsed: ParsedEmployeeInput[]) {
   const lockedOff = new Set<string>();
   parsed.forEach((input, employeeIndex) => {
+    const extraOffBudget = Math.max(0, input.targetOff - input.fixedOff.size);
     input.fixedOff.forEach((day) => lockedOff.add(offKey(employeeIndex, day)));
   });
   return lockedOff;
@@ -404,6 +405,7 @@ function reservePreventiveOffsSetCover(
   const inserted: string[] = [];
 
   parsed.forEach((input, employeeIndex) => {
+    const extraOffBudget = Math.max(0, input.targetOff - input.fixedOff.size);
     const uncoveredWindows = () =>
       Array.from({ length: Math.max(0, days.length - 5) }, (_, index) => index + 1).filter(
         (start) => !hasLockedOffInWindow(lockedOff, employeeIndex, start),
@@ -411,7 +413,8 @@ function reservePreventiveOffsSetCover(
 
     let uncovered = uncoveredWindows();
     while (uncovered.length > 0) {
-      if (lockedOffCount(lockedOff, employeeIndex) >= Math.max(input.minOff, input.fixedOff.size)) {
+      const forcedOffCount = lockedOffCount(lockedOff, employeeIndex) - input.fixedOff.size;
+      if (forcedOffCount >= extraOffBudget) {
         failures.push(
           `${EMPLOYEES[employeeIndex]} ${uncovered[0]}-${uncovered[0] + 5}일: OFF 총량을 늘리지 않고 6일 구간을 차단할 수 없습니다.`,
         );
@@ -425,11 +428,14 @@ function reservePreventiveOffsSetCover(
         .map((day) => ({
           day,
           covered: uncovered.filter((start) => day >= start && day <= start + 5),
+          dayLoad: lockedOffCountForDay(lockedOff, day),
         }))
         .filter((candidate) => candidate.covered.length > 0)
         .sort((a, b) => {
           const coverageDiff = b.covered.length - a.covered.length;
           if (coverageDiff !== 0) return coverageDiff;
+          const loadDiff = a.dayLoad - b.dayLoad;
+          if (loadDiff !== 0) return loadDiff;
           return b.day - a.day || ((a.day + seed) % 3) - ((b.day + seed) % 3);
         })[0];
 
@@ -483,10 +489,7 @@ function reserveGeneratorOffs(
 ) {
   const lockedOff = buildInitialLockedOff(parsed);
   const preventive = reservePreventiveOffsSetCover(schedule, parsed, days, removedM, lockedOff, seed);
-  const failures = [
-    ...preventive.failures,
-    ...reserveMinimumOffs(schedule, parsed, days, removedM, lockedOff, seed),
-  ];
+  const failures = [...preventive.failures];
   return { lockedOff, failures, forcedOffs: preventive.inserted };
 }
 
