@@ -14,6 +14,8 @@ import {
 } from "./types";
 
 type Slot = { dayIndex: number; code: WorkShift };
+type NormalizedShift = WorkShift | "OFF";
+type ParsedWithPrevious = ParsedEmployeeInput & { previousMonthSchedule?: (NormalizedShift | null)[] };
 type Attempt = {
   schedule: Schedule;
   lockedOff: Set<string>;
@@ -26,6 +28,77 @@ type Attempt = {
 const SHIFTS: WorkShift[] = ["D", "E", "M", "N"];
 const MAX_ATTEMPTS = 260000;
 const SLOT_PRIORITY: Record<WorkShift, number> = { N: 0, D: 1, E: 2, M: 3 };
+
+function normalizeShift(code: unknown): NormalizedShift | null {
+  if (code === null || code === undefined) return null;
+  const normalized = String(code).normalize("NFKC").trim().toUpperCase().replace(/\s+/g, "");
+  if (normalized === "") return null;
+  if (normalized === "E1") return "M";
+  if (normalized === "D" || normalized === "E" || normalized === "M" || normalized === "N") return normalized;
+  if (normalized === "/" || normalized === "OFF") return "OFF";
+  return null;
+}
+
+function isEveningLike(code: unknown) {
+  const normalized = normalizeShift(code);
+  return normalized === "E" || normalized === "M";
+}
+
+function previousMonthCandidates(input: EmployeeInput) {
+  const source = input as EmployeeInput & Record<string, unknown>;
+  return [
+    source.previousMonthSchedule,
+    source.previousSchedule,
+    source.previousMonth,
+    source.prevMonthSchedule,
+    source.prevSchedule,
+    source.prevMonth,
+    source.lastMonthSchedule,
+    source.lastMonth,
+  ];
+}
+
+function normalizePreviousMonthSchedule(input: EmployeeInput, previousMonthLength: number): (NormalizedShift | null)[] {
+  const raw = previousMonthCandidates(input).find((candidate) => candidate !== undefined && candidate !== null);
+  if (raw === undefined || raw === null) return [];
+
+  if (Array.isArray(raw)) {
+    return raw.map((code) => normalizeShift(code));
+  }
+
+  if (typeof raw === "string") {
+    const byDay = new Map<number, NormalizedShift | null>();
+    const dayPattern = /(\d+)\s*[:=]\s*(E1|OFF|D|E|M|N|\/)/gi;
+    let match: RegExpExecArray | null;
+    while ((match = dayPattern.exec(raw)) !== null) {
+      const day = Number(match[1]);
+      if (Number.isInteger(day) && day >= 1 && day <= previousMonthLength) byDay.set(day, normalizeShift(match[2]));
+    }
+    if (byDay.size > 0) {
+      return Array.from({ length: previousMonthLength }, (_, index) => byDay.get(index + 1) ?? null);
+    }
+    return raw
+      .split(/[\s,;]+/)
+      .map((code) => normalizeShift(code))
+      .filter((code): code is NormalizedShift => code !== null);
+  }
+
+  if (typeof raw === "object") {
+    const entries = Object.entries(raw as Record<string, unknown>)
+      .map(([day, code]) => [Number(day), normalizeShift(code)] as const)
+      .filter(([day]) => Number.isInteger(day) && day >= 1 && day <= previousMonthLength)
+      .sort((a, b) => a[0] - b[0]);
+    if (entries.length === 0) return [];
+    const length = Math.max(...entries.map(([day]) => day));
+    const result = Array.from({ length }, () => null as NormalizedShift | null);
+    entries.forEach(([day, code]) => {
+      result[day - 1] = code;
+    });
+    return result;
+  }
+
+  return [];
+}
 
 function emptySchedule(dayCount: number): Schedule {
   return Array.from({ length: dayCount }, () =>
@@ -130,53 +203,124 @@ function isLockedOff(lockedOff: Set<string>, employeeIndex: number, day: number)
   return lockedOff.has(offKey(employeeIndex, day));
 }
 
-function wouldExceedConsecutive(schedule: Schedule, employee: Employee, dayIndex: number, code: WorkShift) {
-  const next = [...schedule.map((row) => row[employee])];
-  next[dayIndex] = code;
+function isWorkLike(code: unknown) {
+  const shift = normalizeShift(code);
+  return shift !== null && shift !== "OFF";
+}
+
+function trailingPreviousWorkStreak(parsed: ParsedEmployeeInput[], employeeIndex: number) {
   let streak = 0;
-  for (const shift of next) {
-    if (shift === "/") streak = 0;
-    else {
+  for (const shift of previousTailFor(parsed, employeeIndex)) {
+    if (isWorkLike(shift)) streak += 1;
+    else streak = 0;
+  }
+  return streak;
+}
+
+function wouldExceedConsecutive(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  employeeIndex: number,
+  dayIndex: number,
+  code: WorkShift,
+) {
+  let streak = trailingPreviousWorkStreak(parsed, employeeIndex);
+  for (let index = 0; index < schedule.length; index += 1) {
+    const shift = index === dayIndex ? normalizeShift(code) : getShiftAtWithPrev(schedule, parsed, index, employeeIndex);
+    if (isWorkLike(shift)) {
       streak += 1;
       if (streak > 5) return true;
+    } else {
+      streak = 0;
     }
   }
   return false;
 }
 
-function shiftWithCandidate(schedule: Schedule, employee: Employee, candidateDayIndex: number, candidateCode: WorkShift) {
-  return (index: number) => (index === candidateDayIndex ? candidateCode : schedule[index]?.[employee]);
+function previousTailFor(parsed: ParsedEmployeeInput[], employeeIndex: number) {
+  return (parsed[employeeIndex] as ParsedWithPrevious).previousMonthSchedule ?? [];
 }
 
-function hasKnownPatternViolation(schedule: Schedule, employee: Employee, dayIndex: number, code: WorkShift) {
-  const shiftAt = shiftWithCandidate(schedule, employee, dayIndex, code);
-  const prev = shiftAt(dayIndex - 1);
-  const prevPrev = shiftAt(dayIndex - 2);
-
-  if (prev === "N" && code !== "N") return "N 다음날은 OFF 또는 N만 허용";
-  if (prev === "N" && prevPrev === "N") return "NN 다음날은 반드시 OFF";
-
-  if (code === "D") {
-    if (prev === "E" || prev === "M") return "E/M 다음날 D 금지";
+function getShiftAtWithPrev(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  dayIndex: number,
+  employeeIndex: number,
+): NormalizedShift | null {
+  if (dayIndex < 0) {
+    const previous = previousTailFor(parsed, employeeIndex);
+    return previous[previous.length + dayIndex] ?? null;
   }
-  if (code === "N") {
-    if (prev === "N" && prevPrev === "N") return "NNN 금지";
+  return normalizeShift(schedule[dayIndex]?.[EMPLOYEES[employeeIndex]]);
+}
+
+function getRequestedShiftAtWithPrev(
+  input: ParsedEmployeeInput,
+  dayIndex: number,
+  previousMonthSchedule: (NormalizedShift | null)[] = [],
+): NormalizedShift | null {
+  if (dayIndex < 0) return previousMonthSchedule[previousMonthSchedule.length + dayIndex] ?? null;
+  const day = dayIndex + 1;
+  return normalizeShift(input.requests.get(day)) ?? (input.fixedOff.has(day) ? "OFF" : null);
+}
+
+function isOffLike(code: NormalizedShift | null) {
+  return code === "OFF" || code === null;
+}
+
+function previousNightEndIndex(
+  getShiftAt: (dayIndex: number) => NormalizedShift | null,
+  beforeDayIndex: number,
+  limit: number,
+) {
+  for (let index = beforeDayIndex - 1; index >= limit; index -= 1) {
+    if (getShiftAt(index) === "N") return index;
   }
   return null;
 }
 
-function hasFuturePatternViolation(schedule: Schedule, employee: Employee, dayIndex: number, code: WorkShift) {
-  const shiftAt = shiftWithCandidate(schedule, employee, dayIndex, code);
-  const prev = shiftAt(dayIndex - 1);
-  const next = shiftAt(dayIndex + 1);
-  const afterNext = shiftAt(dayIndex + 2);
-
-  if ((code === "E" || code === "M") && next === "D") return true;
+function nightSpacingViolation(
+  getShiftAt: (dayIndex: number) => NormalizedShift | null,
+  dayIndex: number,
+  code: NormalizedShift | null,
+  previousLimit: number,
+) {
   if (code !== "N") return false;
-  if (prev === "N" && next === "N") return true;
-  if (next !== undefined && next !== "/" && next !== "N") return true;
-  if (next === "N" && afterNext !== undefined && afterNext !== "/") return true;
-  return false;
+  if (getShiftAt(dayIndex - 1) === "N") return false;
+  const previousNightEnd = previousNightEndIndex(getShiftAt, dayIndex, previousLimit);
+  return previousNightEnd !== null && dayIndex - previousNightEnd < 7;
+}
+
+function shiftWithCandidate(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  employeeIndex: number,
+  candidateDayIndex: number,
+  candidateCode: WorkShift,
+) {
+  return (index: number) =>
+    index === candidateDayIndex ? normalizeShift(candidateCode) : getShiftAtWithPrev(schedule, parsed, index, employeeIndex);
+}
+
+function hasKnownPatternViolation(schedule: Schedule, parsed: ParsedEmployeeInput[], employeeIndex: number, dayIndex: number, code: WorkShift) {
+  const shiftAt = shiftWithCandidate(schedule, parsed, employeeIndex, dayIndex, code);
+  const previousLimit = -previousTailFor(parsed, employeeIndex).length;
+  const current = normalizeShift(code);
+  const prev = shiftAt(dayIndex - 1);
+  const prevPrev = shiftAt(dayIndex - 2);
+
+  if (prev === "N" && current !== "N") return "N 다음날은 OFF 또는 N만 허용";
+  if (prev === "N" && prevPrev === "N") return "NN 다음날은 반드시 OFF";
+
+  if (current === "D") {
+    if (isEveningLike(prev)) return "E/M 다음날 D 금지";
+    if (isOffLike(prev) && prevPrev === "N") return "N-O-D 금지";
+  }
+  if (current === "N") {
+    if (prev === "N" && prevPrev === "N") return "NNN 금지";
+    if (nightSpacingViolation(shiftAt, dayIndex, current, previousLimit)) return "N 블록 간 6일 OFF/비-N 간격 필요";
+  }
+  return null;
 }
 
 function canAssign(
@@ -193,33 +337,42 @@ function canAssign(
   if (isLockedOff(attempt.lockedOff, employeeIndex, day)) return false;
   if (isFixedOff(parsed, employeeIndex, day)) return false;
   if (slot.code === "N" && parsed[employeeIndex].fixedOff.has(day + 1)) return false;
-  if (slot.code === "N" && parsed[employeeIndex].requests.has(day + 1) && parsed[employeeIndex].requests.get(day + 1) !== "N") return false;
-  if (slot.code === "N" && attempt.schedule[slot.dayIndex - 1]?.[employee] === "N" && parsed[employeeIndex].requests.has(day + 1)) return false;
+  const nextRequested = normalizeShift(parsed[employeeIndex].requests.get(day + 1));
+  if (slot.code === "N" && parsed[employeeIndex].requests.has(day + 1) && nextRequested !== "N") return false;
+  if (slot.code === "N" && getShiftAtWithPrev(attempt.schedule, parsed, slot.dayIndex - 1, employeeIndex) === "N" && parsed[employeeIndex].requests.has(day + 1)) return false;
   if (attempt.workCounts[employeeIndex] + 1 > maxWork[employeeIndex]) return false;
   if (slot.code === "N" && attempt.shiftCounts[employeeIndex].N + 1 > nMax) return false;
-  if (wouldExceedConsecutive(attempt.schedule, employee, slot.dayIndex, slot.code)) return false;
-  if (hasKnownPatternViolation(attempt.schedule, employee, slot.dayIndex, slot.code)) return false;
-  if (hasFuturePatternViolation(attempt.schedule, employee, slot.dayIndex, slot.code)) return false;
+  if (wouldExceedConsecutive(attempt.schedule, parsed, employeeIndex, slot.dayIndex, slot.code)) return false;
+  if (hasKnownPatternViolation(attempt.schedule, parsed, employeeIndex, slot.dayIndex, slot.code)) return false;
 
-  const requested = parsed[employeeIndex].requests.get(day);
-  if (requested && requested !== slot.code) return false;
+  const requested = normalizeShift(parsed[employeeIndex].requests.get(day));
+  if (requested && requested !== "OFF" && requested !== slot.code) return false;
   return true;
 }
 
 function requestImpossible(parsed: ParsedEmployeeInput[], days: DayInfo[], activeMDays: Set<number>) {
   const failures: string[] = [];
   parsed.forEach((input, index) => {
+    const previous = previousTailFor(parsed, index);
+    const previousLimit = -previous.length;
+    const shiftAt = (dayIndex: number) => getRequestedShiftAtWithPrev(input, dayIndex, previous);
     input.requests.forEach((code, day) => {
       const employee = EMPLOYEES[index];
+      const requested = normalizeShift(code);
+      const dayIndex = day - 1;
+      const prev = shiftAt(dayIndex - 1);
+      const prevPrev = shiftAt(dayIndex - 2);
+      if (requested === null || requested === "OFF") return;
       if (input.fixedOff.has(day)) failures.push(`${employee} ${day}일 희망근무 ${code}: 원티드오프/휴가와 충돌`);
-      if (code === "N" && input.fixedOff.has(day + 1)) failures.push(`${employee} ${day}일 N: 다음날 OFF 침범`);
-      if (input.requests.get(day - 1) === "N" && code !== "N") failures.push(`${employee} ${day}일 ${code}: N 다음날은 OFF 또는 N만 가능`);
-      if (input.requests.get(day - 1) === "N" && input.requests.get(day - 2) === "N") failures.push(`${employee} ${day}일 ${code}: NN 다음날은 반드시 OFF`);
-      if (code === "D" && input.requests.get(day - 2) === "N" && input.fixedOff.has(day - 1)) failures.push(`${employee} ${day}일 D: N-O-D 패턴 금지`);
-      if (code === "N" && input.requests.has(day + 1) && input.requests.get(day + 1) !== "N") failures.push(`${employee} ${day}일 N: 다음날 희망근무와 충돌`);
-      if (code === "N" && input.requests.get(day + 1) === "N" && input.requests.has(day + 2)) failures.push(`${employee} ${day}일 N: NN 다음날 희망근무 불가`);
+      if (requested === "N" && input.fixedOff.has(day + 1)) failures.push(`${employee} ${day}일 N: 다음날 OFF 침범`);
+      if (prev === "N" && requested !== "N") failures.push(`${employee} ${day}일 ${code}: N 다음날은 OFF 또는 N만 가능`);
+      if (prev === "N" && prevPrev === "N") failures.push(`${employee} ${day}일 ${code}: NN 다음날은 반드시 OFF`);
+      if (requested === "D" && isOffLike(prev) && prevPrev === "N") failures.push(`${employee} ${day}일 D: N-O-D 패턴 금지`);
+      if (requested === "N" && input.requests.has(day + 1) && normalizeShift(input.requests.get(day + 1)) !== "N") failures.push(`${employee} ${day}일 N: 다음날 희망근무와 충돌`);
+      if (requested === "N" && normalizeShift(input.requests.get(day + 1)) === "N" && input.requests.has(day + 2)) failures.push(`${employee} ${day}일 N: NN 다음날 희망근무 불가`);
+      if (requested === "N" && nightSpacingViolation(shiftAt, dayIndex, requested, previousLimit)) failures.push(`${employee} ${day}일 N: N 블록 간격 6일 미만`);
       const needed = activeMDays.has(day) ? ["D", "E", "M", "N"] : ["D", "E", "N"];
-      if (!needed.includes(code)) failures.push(`${employee} ${day}일 ${code}: 해당 날짜 필요 근무가 아님`);
+      if (!needed.includes(requested)) failures.push(`${employee} ${day}일 ${code}: 해당 날짜 필요 근무가 아님`);
     });
   });
   return failures;
@@ -228,9 +381,11 @@ function requestImpossible(parsed: ParsedEmployeeInput[], days: DayInfo[], activ
 function fillRequests(schedule: Schedule, parsed: ParsedEmployeeInput[], slots: Slot[]) {
   for (const [employeeIndex, input] of parsed.entries()) {
     for (const [day, code] of input.requests) {
-      const exists = slots.some((slot) => slot.dayIndex === day - 1 && slot.code === code);
+      const requested = normalizeShift(code);
+      if (requested === null || requested === "OFF") continue;
+      const exists = slots.some((slot) => slot.dayIndex === day - 1 && slot.code === requested);
       if (!exists) continue;
-      schedule[day - 1][EMPLOYEES[employeeIndex]] = code;
+      schedule[day - 1][EMPLOYEES[employeeIndex]] = requested;
     }
   }
 }
@@ -526,37 +681,10 @@ function dayConstraintScore(dayIndex: number, parsed: ParsedEmployeeInput[], day
 }
 
 function buildSearchSlots(slots: Slot[], schedule: Schedule, parsed: ParsedEmployeeInput[], days: DayInfo[]) {
-  const remaining = slots.filter((slot) => !EMPLOYEES.some((employee) => schedule[slot.dayIndex][employee] === slot.code));
-  const byKey = new Map(remaining.map((slot) => [`${slot.dayIndex}:${slot.code}`, slot]));
-  const used = new Set<string>();
-  const ordered: Slot[] = [];
-  const addSlot = (slot: Slot | undefined) => {
-    if (!slot) return;
-    const key = `${slot.dayIndex}:${slot.code}`;
-    if (used.has(key)) return;
-    used.add(key);
-    ordered.push(slot);
-  };
-
-  const dayIndexes = days
-    .map((_, dayIndex) => dayIndex)
-    .sort((a, b) => dayConstraintScore(b, parsed, days) - dayConstraintScore(a, parsed, days) || a - b);
-
-  dayIndexes.forEach((dayIndex) => {
-    if (dayConstraintScore(dayIndex, parsed, days) <= 0) return;
-    SHIFTS.filter((code) => byKey.has(`${dayIndex - 1}:${code}`))
-      .sort((a, b) => SLOT_PRIORITY[a] - SLOT_PRIORITY[b])
-      .forEach((code) => addSlot(byKey.get(`${dayIndex - 1}:${code}`)));
-    SHIFTS.filter((code) => byKey.has(`${dayIndex}:${code}`))
-      .sort((a, b) => SLOT_PRIORITY[a] - SLOT_PRIORITY[b])
-      .forEach((code) => addSlot(byKey.get(`${dayIndex}:${code}`)));
-  });
-
-  remaining
+  return slots
+    .filter((slot) => !EMPLOYEES.some((employee) => schedule[slot.dayIndex][employee] === slot.code))
     .sort((a, b) => a.dayIndex - b.dayIndex || SLOT_PRIORITY[a.code] - SLOT_PRIORITY[b.code])
-    .forEach(addSlot);
-
-  return ordered;
+    .map((slot) => slot);
 }
 
 function scoreCandidate(
@@ -631,28 +759,29 @@ function search(
 function validateHard(schedule: Schedule, parsed: ParsedEmployeeInput[], days: DayInfo[], activeMDays = new Set(days.filter((day) => day.isRestDay).map((day) => day.day))) {
   const failures: string[] = [];
   EMPLOYEES.forEach((employee, employeeIndex) => {
-    let streak = 0;
-    let nStreak = 0;
+    let streak = trailingPreviousWorkStreak(parsed, employeeIndex);
+    const previousLimit = -previousTailFor(parsed, employeeIndex).length;
+    const shiftAt = (dayIndex: number) => getShiftAtWithPrev(schedule, parsed, dayIndex, employeeIndex);
     for (let dayIndex = 0; dayIndex < days.length; dayIndex += 1) {
       const day = dayIndex + 1;
-      const shift = schedule[dayIndex][employee];
-      if (parsed[employeeIndex].fixedOff.has(day) && shift !== "/") failures.push(`${employee} ${day}일 OFF/휴가 근무 배정 금지`);
-      if (shift === "N" && parsed[employeeIndex].fixedOff.has(day + 1)) failures.push(`${employee} ${day}일 N이 다음날 OFF를 침범`);
-      if (shift === "/") {
+      const rawShift = schedule[dayIndex][employee];
+      const current = shiftAt(dayIndex);
+      const prev = shiftAt(dayIndex - 1);
+      const prevPrev = shiftAt(dayIndex - 2);
+      if (parsed[employeeIndex].fixedOff.has(day) && rawShift !== "/") failures.push(`${employee} ${day}일 OFF/휴가 근무 배정 금지`);
+      if (current === "N" && parsed[employeeIndex].fixedOff.has(day + 1)) failures.push(`${employee} ${day}일 N이 다음날 OFF를 침범`);
+      if (isOffLike(current)) {
         streak = 0;
-        nStreak = 0;
       } else {
         streak += 1;
         if (streak > 5) failures.push(`${employee} 6연속 근무 발생`);
-        nStreak = shift === "N" ? nStreak + 1 : 0;
-        if (nStreak > 2) failures.push(`${employee} NNN 발생`);
       }
-      const next = schedule[dayIndex + 1]?.[employee];
-      const afterNext = schedule[dayIndex + 2]?.[employee];
-      if ((shift === "E" || shift === "M") && next === "D") failures.push(`${employee} ${day}일 ${shift} 다음날 D 발생`);
-      if (shift === "N" && next !== undefined && next !== "/" && next !== "N") failures.push(`${employee} ${day}일 N 다음날 ${next} 발생`);
-      if (shift === "N" && next === "N" && afterNext !== undefined && afterNext !== "/") failures.push(`${employee} ${day}일 NN 다음날 ${afterNext} 발생`);
-      if (shift === "N" && next === "/" && afterNext === "D") failures.push(`${employee} ${day}일 N-O-D 발생`);
+      if (current === "D" && isEveningLike(prev)) failures.push(`${employee} ${day}일 E/M 다음날 D 발생`);
+      if (prev === "N" && !isOffLike(current) && current !== "N") failures.push(`${employee} ${day}일 N 다음날 ${current} 발생`);
+      if (current === "N" && prev === "N" && prevPrev === "N") failures.push(`${employee} ${day}일 NNN 발생`);
+      else if (prev === "N" && prevPrev === "N" && !isOffLike(current)) failures.push(`${employee} ${day}일 NN 다음날 ${current} 발생`);
+      if (current === "D" && isOffLike(prev) && prevPrev === "N") failures.push(`${employee} ${day}일 N-O-D 발생`);
+      if (nightSpacingViolation(shiftAt, dayIndex, current, previousLimit)) failures.push(`${employee} ${day}일 N 블록 간격 6일 미만`);
     }
     const offCount = schedule.filter((row) => row[employee] === "/").length;
     if (offCount < parsed[employeeIndex].minOff) failures.push(`${employee} 월 OFF ${offCount}개: 최소 ${parsed[employeeIndex].minOff}개 미달`);
@@ -877,22 +1006,29 @@ function requestedShiftConflicts(parsed: ParsedEmployeeInput[], days: DayInfo[],
   const conflicts: string[] = [];
   parsed.forEach((input, index) => {
     const employee = EMPLOYEES[index];
+    const previous = previousTailFor(parsed, index);
+    const previousLimit = -previous.length;
+    const shiftAt = (dayIndex: number) => getRequestedShiftAtWithPrev(input, dayIndex, previous);
     input.requests.forEach((code, day) => {
-      const prev = input.requests.get(day - 1);
-      const prevPrev = input.requests.get(day - 2);
-      const next = input.requests.get(day + 1);
-      const nextNext = input.requests.get(day + 2);
+      const requested = normalizeShift(code);
+      const dayIndex = day - 1;
+      const prev = shiftAt(dayIndex - 1);
+      const prevPrev = shiftAt(dayIndex - 2);
+      const next = shiftAt(dayIndex + 1);
+      const nextNext = shiftAt(dayIndex + 2);
       const needed = activeMDays.has(day) ? ["D", "E", "M", "N"] : ["D", "E", "N"];
+      if (requested === null || requested === "OFF") return;
 
       if (input.fixedOff.has(day)) conflicts.push(`${employee} ${day}일 ${code}: 원티드오프/휴가와 충돌`);
-      if (!needed.includes(code)) conflicts.push(`${employee} ${day}일 ${code}: 해당 날짜 필요 근무가 아님`);
-      if ((prev === "E" || prev === "M") && code === "D") conflicts.push(`${employee} ${day - 1}일 ${prev} -> ${day}일 D`);
-      if (prev === "N" && code !== "N") conflicts.push(`${employee} ${day - 1}일 N -> ${day}일 ${code}`);
+      if (!needed.includes(requested)) conflicts.push(`${employee} ${day}일 ${code}: 해당 날짜 필요 근무가 아님`);
+      if (isEveningLike(prev) && requested === "D") conflicts.push(`${employee} ${day - 1}일 ${prev} -> ${day}일 D`);
+      if (prev === "N" && requested !== "N") conflicts.push(`${employee} ${day - 1}일 N -> ${day}일 ${code}`);
       if (prev === "N" && prevPrev === "N") conflicts.push(`${employee} ${day}일 ${code}: NN 다음날은 반드시 OFF`);
-      if (code === "N" && input.fixedOff.has(day + 1)) conflicts.push(`${employee} ${day}일 N: 다음날 원티드오프/휴가 침범`);
-      if (code === "N" && next && next !== "N") conflicts.push(`${employee} ${day}일 N -> ${day + 1}일 ${next}`);
-      if (code === "N" && next === "N" && nextNext) conflicts.push(`${employee} ${day}일 N -> ${day + 1}일 N -> ${day + 2}일 ${nextNext}`);
-      if (code === "D" && input.fixedOff.has(day - 1) && input.requests.get(day - 2) === "N") conflicts.push(`${employee} ${day - 2}일 N -> ${day - 1}일 / -> ${day}일 D`);
+      if (requested === "N" && input.fixedOff.has(day + 1)) conflicts.push(`${employee} ${day}일 N: 다음날 원티드오프/휴가 침범`);
+      if (requested === "N" && next && next !== "OFF" && next !== "N") conflicts.push(`${employee} ${day}일 N -> ${day + 1}일 ${next}`);
+      if (requested === "N" && next === "N" && nextNext && nextNext !== "OFF") conflicts.push(`${employee} ${day}일 N -> ${day + 1}일 N -> ${day + 2}일 ${nextNext}`);
+      if (requested === "D" && isOffLike(prev) && prevPrev === "N") conflicts.push(`${employee} ${day - 2}일 N -> ${day - 1}일 / -> ${day}일 D`);
+      if (requested === "N" && nightSpacingViolation(shiftAt, dayIndex, requested, previousLimit)) conflicts.push(`${employee} ${day}일 N: N 블록 간격 6일 미만`);
     });
   });
   return [...new Set(conflicts)];
@@ -902,11 +1038,15 @@ function emToDBlockedDates(parsed: ParsedEmployeeInput[]) {
   const blocked: string[] = [];
   parsed.forEach((input, index) => {
     const employee = EMPLOYEES[index];
+    const previous = previousTailFor(parsed, index);
+    const shiftAt = (dayIndex: number) => getRequestedShiftAtWithPrev(input, dayIndex, previous);
     input.requests.forEach((code, day) => {
-      const next = input.requests.get(day + 1);
-      const prev = input.requests.get(day - 1);
-      if ((code === "E" || code === "M") && next === "D") blocked.push(`${employee}: ${day}일 ${code} -> ${day + 1}일 D`);
-      if (code === "D" && (prev === "E" || prev === "M")) blocked.push(`${employee}: ${day - 1}일 ${prev} -> ${day}일 D`);
+      const requested = normalizeShift(code);
+      const dayIndex = day - 1;
+      const next = shiftAt(dayIndex + 1);
+      const prev = shiftAt(dayIndex - 1);
+      if (isEveningLike(requested) && next === "D") blocked.push(`${employee}: ${day}일 ${code} -> ${day + 1}일 D`);
+      if (requested === "D" && isEveningLike(prev)) blocked.push(`${employee}: ${day - 1}일 ${prev} -> ${day}일 D`);
     });
   });
   return [...new Set(blocked)];
@@ -981,7 +1121,13 @@ export function generateSchedule(
   variant = 0,
 ): ScheduleResult {
   const days = buildDays(year, month, manualHolidayDays);
-  const parsed = EMPLOYEES.map((employee) => parseEmployeeInput(inputs[employee], days.length));
+  const previousMonthLength = new Date(year, month - 1, 0).getDate();
+  const parsed = EMPLOYEES.map((employee) => {
+    const input = inputs[employee];
+    const parsedInput = parseEmployeeInput(input, days.length) as ParsedWithPrevious;
+    parsedInput.previousMonthSchedule = normalizePreviousMonthSchedule(input, previousMonthLength);
+    return parsedInput;
+  });
   const { activeMDays, removedM: removedMDays } = activeMDaysForMonth(days, parsed);
   const removedM = new Set(removedMDays);
   const slots = requiredSlots(days, activeMDays);
