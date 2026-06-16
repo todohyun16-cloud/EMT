@@ -1093,6 +1093,7 @@ function scoreCandidate(
   employeeIndex: number,
   days: DayInfo[],
   seed: number,
+  preferredMDays = new Set<number>(),
 ) {
   const day = slot.dayIndex + 1;
   const employee = EMPLOYEES[employeeIndex];
@@ -1112,6 +1113,14 @@ function scoreCandidate(
   score -= Math.max(0, projectedOff - parsed[employeeIndex].minOff) * 3;
   const prev = attempt.schedule[slot.dayIndex - 1]?.[employee];
   if (prev !== "/" && prev !== undefined) score += 8;
+  if (preferredMDays.has(day)) {
+    const candidate = attempt.schedule.map((row) => ({ ...row })) as Schedule;
+    candidate[slot.dayIndex][employee] = slot.code;
+    const lockedOff = attempt.lockedOff;
+    const canStillAssignM = EMPLOYEES.some((_, index) => canReserveMForPartial(candidate, parsed, lockedOff, index, slot.dayIndex));
+    if (!canStillAssignM) score += 260;
+    else if (canReserveMForPartial(attempt.schedule, parsed, lockedOff, employeeIndex, slot.dayIndex)) score += 35;
+  }
   return score + exploration;
 }
 
@@ -1147,6 +1156,7 @@ function search(
   maxWork: number[],
   calls: { count: number },
   seed: number,
+  preferredMDays = new Set<number>(),
 ): boolean {
   calls.count += 1;
   if (calls.count > MAX_ATTEMPTS || performance.now() > attempt.deadline) return false;
@@ -1160,7 +1170,7 @@ function search(
   searchSlots[nextSlotIndex] = slotAtCurrent;
   const slot = searchSlots[attempt.slotIndex];
   const candidates = candidatesForSlot(attempt, parsed, slot, maxWork)
-    .sort((a, b) => scoreCandidate(attempt, parsed, slot, a, days, seed) - scoreCandidate(attempt, parsed, slot, b, days, seed));
+    .sort((a, b) => scoreCandidate(attempt, parsed, slot, a, days, seed, preferredMDays) - scoreCandidate(attempt, parsed, slot, b, days, seed, preferredMDays));
 
   for (const employeeIndex of candidates) {
     const employee = EMPLOYEES[employeeIndex];
@@ -1169,7 +1179,7 @@ function search(
     attempt.shiftCounts[employeeIndex][slot.code] += 1;
     attempt.slotIndex += 1;
 
-    if (search(attempt, searchSlots, parsed, days, maxWork, calls, seed)) return true;
+    if (search(attempt, searchSlots, parsed, days, maxWork, calls, seed, preferredMDays)) return true;
 
     attempt.slotIndex -= 1;
     attempt.shiftCounts[employeeIndex][slot.code] -= 1;
@@ -1445,8 +1455,63 @@ type MPostProcessResult = {
   warnings: string[];
 };
 
+type MDayDiagnostic = {
+  day: number;
+  candidates: string[];
+  rejections: string[];
+  repairAttempted: boolean;
+  repairFailure: string;
+};
+
 function currentMCount(schedule: Schedule, dayIndex: number) {
   return EMPLOYEES.filter((employee) => schedule[dayIndex][employee] === "M").length;
+}
+
+function canReserveMForPartial(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  lockedOff: Set<string>,
+  employeeIndex: number,
+  dayIndex: number,
+) {
+  const employee = EMPLOYEES[employeeIndex];
+  const day = dayIndex + 1;
+  if (schedule[dayIndex][employee] !== "/") return false;
+  if (isLockedOff(lockedOff, employeeIndex, day)) return false;
+  if (isFixedOff(parsed, employeeIndex, day)) return false;
+  if (wouldExceedConsecutive(schedule, parsed, employeeIndex, dayIndex, "M")) return false;
+  if (hasKnownPatternViolation(schedule, parsed, employeeIndex, dayIndex, "M")) return false;
+  const next = getShiftAtWithPrev(schedule, parsed, dayIndex + 1, employeeIndex);
+  if (next === "D") return false;
+  return true;
+}
+
+function canTryAddMReason(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  lockedOff: Set<string>,
+  employeeIndex: number,
+  dayIndex: number,
+) {
+  const employee = EMPLOYEES[employeeIndex];
+  const day = dayIndex + 1;
+  if (schedule[dayIndex][employee] !== "/") return `already assigned ${schedule[dayIndex][employee]}`;
+  if (isLockedOff(lockedOff, employeeIndex, day)) return "locked recovery OFF";
+  if (isFixedOff(parsed, employeeIndex, day)) return "fixedOff/vacation/wantedOff";
+
+  const candidate = schedule.map((row) => ({ ...row })) as Schedule;
+  candidate[dayIndex][employee] = "M";
+  const failures = validateHard(candidate, parsed, days).filter((failure) => failure.includes(employee) || failure.includes("Non-leave"));
+  if (failures.length === 0) return null;
+  const first = failures[0];
+  if (first.includes("E/M -> D")) return "E/M -> D";
+  if (first.includes("more than 5 consecutive")) return "max consecutive work";
+  if (first.includes("OFF count")) return "minOff";
+  if (first.includes("Non-leave")) return "non-leave OFF balance";
+  if (first.includes("N-O-D")) return "N-O-D";
+  if (first.includes("fixed OFF")) return "fixedOff/vacation/wantedOff";
+  return first;
 }
 
 function canTryAddM(
@@ -1457,15 +1522,7 @@ function canTryAddM(
   employeeIndex: number,
   dayIndex: number,
 ) {
-  const employee = EMPLOYEES[employeeIndex];
-  const day = dayIndex + 1;
-  if (schedule[dayIndex][employee] !== "/") return false;
-  if (isLockedOff(lockedOff, employeeIndex, day)) return false;
-  if (isFixedOff(parsed, employeeIndex, day)) return false;
-
-  const candidate = schedule.map((row) => ({ ...row })) as Schedule;
-  candidate[dayIndex][employee] = "M";
-  return validateHard(candidate, parsed, days).length === 0;
+  return canTryAddMReason(schedule, parsed, days, lockedOff, employeeIndex, dayIndex) === null;
 }
 
 function scoreMCandidate(
@@ -1489,6 +1546,19 @@ function scoreMCandidate(
   );
 }
 
+function mCandidates(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  lockedOff: Set<string>,
+  dayIndex: number,
+  seed: number,
+) {
+  return EMPLOYEES.map((_, index) => index)
+    .filter((index) => canTryAddM(schedule, parsed, days, lockedOff, index, dayIndex))
+    .sort((a, b) => scoreMCandidate(schedule, parsed, days, a, dayIndex, seed) - scoreMCandidate(schedule, parsed, days, b, dayIndex, seed));
+}
+
 function addOneM(
   schedule: Schedule,
   parsed: ParsedEmployeeInput[],
@@ -1497,12 +1567,130 @@ function addOneM(
   dayIndex: number,
   seed: number,
 ) {
-  const employeeIndex = EMPLOYEES.map((_, index) => index)
-    .filter((index) => canTryAddM(schedule, parsed, days, lockedOff, index, dayIndex))
-    .sort((a, b) => scoreMCandidate(schedule, parsed, days, a, dayIndex, seed) - scoreMCandidate(schedule, parsed, days, b, dayIndex, seed))[0];
+  const employeeIndex = mCandidates(schedule, parsed, days, lockedOff, dayIndex, seed)[0];
   if (employeeIndex === undefined) return false;
   schedule[dayIndex][EMPLOYEES[employeeIndex]] = "M";
   return true;
+}
+
+function mDayDiagnostic(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  lockedOff: Set<string>,
+  day: number,
+  repairAttempted = false,
+  repairFailure = "not attempted",
+): MDayDiagnostic {
+  const dayIndex = day - 1;
+  const candidates = EMPLOYEES.filter((_, employeeIndex) => canTryAddM(schedule, parsed, days, lockedOff, employeeIndex, dayIndex));
+  const rejections = EMPLOYEES.map((employee, employeeIndex) => {
+    const reason = canTryAddMReason(schedule, parsed, days, lockedOff, employeeIndex, dayIndex);
+    return reason ? `${employee}: ${reason}` : "";
+  }).filter(Boolean);
+  return {
+    day,
+    candidates,
+    rejections,
+    repairAttempted,
+    repairFailure,
+  };
+}
+
+function tryLocalRepairForM(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  lockedOff: Set<string>,
+  dayIndex: number,
+  seed: number,
+) {
+  const shiftsToMove: WorkShift[] = ["D", "E"];
+  for (const shift of shiftsToMove) {
+    const currentEmployee = EMPLOYEES.find((employee) => schedule[dayIndex][employee] === shift);
+    if (!currentEmployee) continue;
+    const currentIndex = EMPLOYEES.indexOf(currentEmployee);
+    for (const replacementIndex of EMPLOYEES.map((_, index) => index).sort((a, b) => seededNoise(seed, dayIndex, a) - seededNoise(seed, dayIndex, b))) {
+      const replacement = EMPLOYEES[replacementIndex];
+      if (replacementIndex === currentIndex || schedule[dayIndex][replacement] !== "/") continue;
+      const candidate = schedule.map((row) => ({ ...row })) as Schedule;
+      candidate[dayIndex][currentEmployee] = "/";
+      candidate[dayIndex][replacement] = shift;
+      if (validateHard(candidate, parsed, days).length > 0) continue;
+      if (canTryAddM(candidate, parsed, days, lockedOff, currentIndex, dayIndex)) {
+        candidate[dayIndex][currentEmployee] = "M";
+        if (validateHard(candidate, parsed, days).length === 0) return candidate;
+      }
+    }
+  }
+
+  const nextDayIndex = dayIndex + 1;
+  if (nextDayIndex < days.length) {
+    for (const potentialMIndex of EMPLOYEES.map((_, index) => index)) {
+      const potentialMEmployee = EMPLOYEES[potentialMIndex];
+      if (schedule[dayIndex][potentialMEmployee] !== "/" || schedule[nextDayIndex][potentialMEmployee] !== "D") continue;
+      for (const replacementIndex of EMPLOYEES.map((_, index) => index)) {
+        const replacement = EMPLOYEES[replacementIndex];
+        if (replacementIndex === potentialMIndex || schedule[nextDayIndex][replacement] !== "/") continue;
+        const candidate = schedule.map((row) => ({ ...row })) as Schedule;
+        candidate[nextDayIndex][potentialMEmployee] = "/";
+        candidate[nextDayIndex][replacement] = "D";
+        if (validateHard(candidate, parsed, days).length > 0) continue;
+        if (canTryAddM(candidate, parsed, days, lockedOff, potentialMIndex, dayIndex)) {
+          candidate[dayIndex][potentialMEmployee] = "M";
+          if (validateHard(candidate, parsed, days).length === 0) return candidate;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function optimizeWeekendHolidayM(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  lockedOff: Set<string>,
+  desiredDays: number[],
+  seed: number,
+) {
+  let best = schedule.map((row) => ({ ...row })) as Schedule;
+  let bestAssigned = -1;
+  let nodes = 0;
+  const deadline = performance.now() + 900;
+
+  const dfs = (current: Schedule, remainingDays: number[], assigned: number) => {
+    nodes += 1;
+    if (performance.now() > deadline || nodes > 12000) return;
+    if (assigned + remainingDays.length < bestAssigned) return;
+    if (remainingDays.length === 0) {
+      if (assigned > bestAssigned || (assigned === bestAssigned && tier2Score(current, days, parsed) < tier2Score(best, days, parsed))) {
+        best = current.map((row) => ({ ...row })) as Schedule;
+        bestAssigned = assigned;
+      }
+      return;
+    }
+
+    const ordered = [...remainingDays].sort((a, b) => {
+      const aCandidates = mCandidates(current, parsed, days, lockedOff, a - 1, seed).length;
+      const bCandidates = mCandidates(current, parsed, days, lockedOff, b - 1, seed).length;
+      return aCandidates - bCandidates || a - b;
+    });
+    const day = ordered[0];
+    const nextRemaining = ordered.slice(1);
+    const dayIndex = day - 1;
+    const candidates = mCandidates(current, parsed, days, lockedOff, dayIndex, seed + day);
+
+    for (const employeeIndex of candidates) {
+      const candidate = current.map((row) => ({ ...row })) as Schedule;
+      candidate[dayIndex][EMPLOYEES[employeeIndex]] = "M";
+      if (validateHard(candidate, parsed, days).length === 0) dfs(candidate, nextRemaining, assigned + 1);
+    }
+    dfs(current, nextRemaining, assigned);
+  };
+
+  dfs(schedule.map((row) => ({ ...row })) as Schedule, desiredDays, 0);
+  return { schedule: best, assigned: Math.max(0, bestAssigned) };
 }
 
 function postProcessM(
@@ -1514,18 +1702,24 @@ function postProcessM(
   initiallyRemovedMDays: number[],
   seed: number,
 ): MPostProcessResult {
-  const result = schedule.map((row) => ({ ...row })) as Schedule;
-  const removed = new Set(initiallyRemovedMDays);
-  let assignedWeekendHolidayMCount = 0;
+  const desiredWeekendHolidayDays = [...new Set([...desiredMDays, ...initiallyRemovedMDays])].sort((a, b) => a - b);
+  let optimized = optimizeWeekendHolidayM(schedule, parsed, days, lockedOff, desiredWeekendHolidayDays, seed).schedule;
+  const repairDiagnostics = new Map<number, MDayDiagnostic>();
 
-  [...desiredMDays].sort((a, b) => a - b).forEach((day) => {
+  for (const day of desiredWeekendHolidayDays) {
     const dayIndex = day - 1;
-    if (currentMCount(result, dayIndex) > 0 || addOneM(result, parsed, days, lockedOff, dayIndex, seed)) {
-      assignedWeekendHolidayMCount += 1;
+    if (currentMCount(optimized, dayIndex) > 0) continue;
+    const repaired = tryLocalRepairForM(optimized, parsed, days, lockedOff, dayIndex, seed + day);
+    if (repaired) {
+      optimized = repaired;
     } else {
-      removed.add(day);
+      repairDiagnostics.set(day, mDayDiagnostic(optimized, parsed, days, lockedOff, day, true, "bounded D/E swap and next-day D move could not free a feasible M employee"));
     }
-  });
+  }
+
+  const assignedWeekendHolidayMCount = desiredWeekendHolidayDays.filter((day) => currentMCount(optimized, day - 1) > 0).length;
+  const removed = new Set(desiredWeekendHolidayDays.filter((day) => currentMCount(optimized, day - 1) === 0));
+  let result = optimized.map((row) => ({ ...row })) as Schedule;
 
   let weekdayCompensationMCount = 0;
   const weekdayIndexes = days
@@ -1567,15 +1761,28 @@ function postProcessM(
   ];
   if (removedWeekendHolidayMCount > 0) {
     warnings.push(`Removed weekend/holiday M days: ${listDays([...removed].sort((a, b) => a - b))}.`);
+    [...removed].sort((a, b) => a - b).forEach((day) => {
+      const diagnostic = repairDiagnostics.get(day) ?? mDayDiagnostic(result, parsed, days, lockedOff, day, false, "not attempted");
+      warnings.push(
+        `Removed M day ${day}: candidates ${diagnostic.candidates.length > 0 ? diagnostic.candidates.join(", ") : "none"}; rejected ${
+          diagnostic.rejections.length > 0 ? diagnostic.rejections.join(" / ") : "none"
+        }; repair ${diagnostic.repairAttempted ? "attempted" : "not attempted"}; ${diagnostic.repairFailure}.`,
+      );
+    });
   }
   if (uncompensatedMCount > 0) {
     warnings.push(`${uncompensatedMCount} removed weekend/holiday M shift(s) could not be compensated on weekdays.`);
+  }
+  const finalHardFailures = validateHard(result, parsed, days);
+  if (finalHardFailures.length > 0) {
+    warnings.push(`M post-processing kept the core schedule because tentative M changes had hard-rule issues: ${finalHardFailures.join(" / ")}`);
+    result = schedule.map((row) => ({ ...row })) as Schedule;
   }
 
   return {
     schedule: result,
     removedM: [...removed].sort((a, b) => a - b),
-    desiredWeekendHolidayMCount,
+    desiredWeekendHolidayMCount: desiredWeekendHolidayDays.length,
     assignedWeekendHolidayMCount,
     removedWeekendHolidayMCount,
     weekdayCompensationMCount,
@@ -1787,6 +1994,7 @@ export function generateSchedule(
     return parsedInput;
   });
   const { activeMDays, removedM: removedMDays } = activeMDaysForMonth(days, parsed);
+  const preferredMDays = new Set([...activeMDays, ...removedMDays]);
   const slots = requiredSlots(days);
   const nightBlocks = buildNightBlocks(days.length);
   const hardOffCapacityFailures = dailyHardOffCapacityFailures(days, parsed);
@@ -1876,7 +2084,7 @@ export function generateSchedule(
       };
       const calls = { count: 0 };
 
-      if (search(attempt, searchSlots, parsed, days, maxWork, calls, effectiveSeed)) {
+      if (search(attempt, searchSlots, parsed, days, maxWork, calls, effectiveSeed, preferredMDays)) {
         const improved = improve(attempt.schedule, parsed, days, lockedOff);
         const withM = postProcessM(improved.schedule, parsed, days, lockedOff, activeMDays, removedMDays, effectiveSeed);
         const stats = computeStats(withM.schedule, days);
