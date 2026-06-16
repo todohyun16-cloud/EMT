@@ -429,12 +429,9 @@ function canAssignNightBlock(
   blockMax: number,
 ) {
   const employee = EMPLOYEES[employeeIndex];
-  if (blockCounts[employeeIndex] + 1 > blockMax) return `${employee} night block count exceeds ${blockMax}`;
+  if (blockCounts[employeeIndex] + 1 > blockMax) return `${employee}: N block count target exceeded`;
   for (const day of block.days) {
-    if (parsed[employeeIndex].fixedOff.has(day)) return `${employee} day ${day}: N block conflicts with fixed OFF/vacation`;
-    if (day + 1 <= schedule.length && parsed[employeeIndex].fixedOff.has(day + 1)) {
-      return `${employee} day ${day}: N shift intrudes into day ${day + 1} fixed OFF/vacation`;
-    }
+    if (parsed[employeeIndex].fixedOff.has(day)) return `${employee} day ${day}: N block day fixedOff/vacation/wantedOff`;
     const requested = normalizeShift(parsed[employeeIndex].requests.get(day));
     if (requested && requested !== "N" && requested !== "M") return `${employee} day ${day}: requested ${requested} conflicts with N block`;
     if (schedule[day - 1][employee] !== "/") return `${employee} day ${day}: already assigned`;
@@ -455,12 +452,71 @@ function canAssignNightBlock(
   const recoveryDay = block.endDay + 1;
   if (recoveryDay <= schedule.length) {
     const requested = normalizeShift(parsed[employeeIndex].requests.get(recoveryDay));
-    if (requested && requested !== "OFF" && requested !== "M") {
-      return `${employee} day ${recoveryDay}: recovery OFF conflicts with requested ${requested}`;
+    if (requested && requested !== "OFF") {
+      return `${employee} day ${recoveryDay}: requested work ${requested} on recovery OFF day`;
     }
   }
 
   return null;
+}
+
+function canNightCountsStillBalance(blockCounts: number[], assignedBlocks: number, totalBlocks: number, blockMin: number, blockMax: number) {
+  const remainingBlocks = totalBlocks - assignedBlocks;
+  if (blockCounts.some((count) => count > blockMax)) return false;
+  const neededToReachMin = blockCounts.reduce((sum, count) => sum + Math.max(0, blockMin - count), 0);
+  if (neededToReachMin > remainingBlocks) return false;
+  return true;
+}
+
+function summarizeNightBlockCandidates(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  blocks: NightBlock[],
+  blockCounts: number[],
+  blockMax: number,
+) {
+  const summaries = blocks.map((block) => {
+    const rejected = EMPLOYEES.map((employee, employeeIndex) => ({
+      employee,
+      reason: canAssignNightBlock(schedule, parsed, block, employeeIndex, blockCounts, blockMax),
+    }));
+    const eligible = rejected.filter((item) => !item.reason).map((item) => item.employee);
+    return { block, eligible, rejected: rejected.filter((item): item is { employee: Employee; reason: string } => Boolean(item.reason)) };
+  });
+  const mostConstrained = [...summaries].sort((a, b) => a.eligible.length - b.eligible.length || a.block.startDay - b.block.startDay)[0];
+  const firstZero = summaries.find((summary) => summary.eligible.length === 0);
+  const reasonCounts = new Map<string, number>();
+  summaries.forEach((summary) => {
+    summary.rejected.forEach(({ reason }) => reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1));
+  });
+  const topReasons = [...reasonCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 8)
+    .map(([reason, count]) => `${reason} (${count})`);
+  return [
+    ...(firstZero
+      ? [`First N block with zero candidates: ${firstZero.block.startDay}-${firstZero.block.endDay}.`]
+      : ["No N block has zero candidates before recursive spacing/count choices."]),
+    ...(mostConstrained
+      ? [
+          `Most constrained N block: ${mostConstrained.block.startDay}-${mostConstrained.block.endDay}; eligible employees: ${
+            mostConstrained.eligible.length > 0 ? mostConstrained.eligible.join(", ") : "none"
+          }.`,
+        ]
+      : []),
+    `N candidate counts by block: ${summaries.map((summary) => `${summary.block.startDay}-${summary.block.endDay}:${summary.eligible.length}`).join(", ")}.`,
+    `Top N rejection reasons: ${topReasons.length > 0 ? topReasons.join(" / ") : "none"}.`,
+    ...summaries.slice(0, 15).map(
+      (summary) =>
+        `N block ${summary.block.startDay}-${summary.block.endDay}: eligible ${
+          summary.eligible.length > 0 ? summary.eligible.join(", ") : "none"
+        }; rejected ${
+          summary.rejected.length > 0
+            ? summary.rejected.map(({ employee, reason }) => `${employee}=${reason}`).join("; ")
+            : "none"
+        }`,
+    ),
+  ];
 }
 
 function hasBasicDEFeasibility(
@@ -520,6 +576,10 @@ function assignNightBlocks(
     if (orderIndex >= blocks.length) {
       return Math.min(...blockCounts) >= blockMin && Math.max(...blockCounts) <= blockMax;
     }
+    if (!canNightCountsStillBalance(blockCounts, orderIndex, blocks.length, blockMin, blockMax)) {
+      failures.push("N block count balance impossible");
+      return false;
+    }
 
     const remaining = blocks
       .map((block, index) => ({ block, index }))
@@ -561,7 +621,13 @@ function assignNightBlocks(
       const recoveryDay = block.endDay + 1;
       if (recoveryDay <= schedule.length) lockedRecoveryOff.add(offKey(employeeIndex, recoveryDay));
 
-      if (hasBasicDEFeasibility(schedule, parsed, days, lockedRecoveryOff) && dfs(orderIndex + 1)) return true;
+      if (
+        canNightCountsStillBalance(blockCounts, orderIndex + 1, blocks.length, blockMin, blockMax) &&
+        hasBasicDEFeasibility(schedule, parsed, days, lockedRecoveryOff) &&
+        dfs(orderIndex + 1)
+      ) {
+        return true;
+      }
 
       if (recoveryDay <= schedule.length) lockedRecoveryOff.delete(offKey(employeeIndex, recoveryDay));
       blockCounts[employeeIndex] -= 1;
@@ -573,9 +639,13 @@ function assignNightBlocks(
   };
 
   if (!dfs(0)) {
+    const candidateDiagnostics = summarizeNightBlockCandidates(baseSchedule, parsed, blocks, EMPLOYEES.map(() => 0), blockMax);
     return {
       ok: false,
-      failures: failures.length > 0 ? [...new Set(failures)] : ["Unable to assign N blocks with spacing, recovery OFF, and block-count balance"],
+      failures: [
+        ...(failures.length > 0 ? [...new Set(failures)] : ["Unable to assign N blocks with spacing, recovery OFF, and block-count balance"]),
+        ...candidateDiagnostics,
+      ],
     };
   }
 
@@ -999,7 +1069,6 @@ function validateHard(schedule: Schedule, parsed: ParsedEmployeeInput[], days: D
       const prev = shiftAt(dayIndex - 1);
       const prevPrev = shiftAt(dayIndex - 2);
       if (parsed[employeeIndex].fixedOff.has(day) && rawShift !== "/") failures.push(`${employee} day ${day}: work assigned on fixed OFF/vacation`);
-      if (current === "N" && parsed[employeeIndex].fixedOff.has(day + 1)) failures.push(`${employee} day ${day}: N shift intrudes into next-day fixed OFF/vacation`);
       if (isOffLike(current)) {
         streak = 0;
       } else {
@@ -1454,8 +1523,7 @@ function nPossibleDaysForEmployee(input: ParsedEmployeeInput, days: DayInfo[]) {
     let reason = "";
 
     if (input.fixedOff.has(day)) reason = "same-day fixed OFF/vacation";
-    else if (input.fixedOff.has(day + 1)) reason = "next-day fixed OFF/vacation";
-    else if (nextRequest && nextRequest !== "N" && nextRequest !== "M") reason = `next-day requested work ${nextRequest}`;
+    else if (nextRequest && nextRequest !== "N") reason = `next-day requested work ${nextRequest}`;
     else if (input.requests.get(day - 1) === "N" && input.requests.get(day - 2) === "N") reason = "NNN is forbidden";
     else if (input.requests.get(day - 1) === "N" && input.requests.has(day + 1)) reason = "after NN, recovery OFF is unavailable";
 
