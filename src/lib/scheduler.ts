@@ -519,9 +519,14 @@ function assignNightBlocks(
 function buildInitialLockedOff(parsed: ParsedEmployeeInput[]) {
   const lockedOff = new Set<string>();
   parsed.forEach((input, employeeIndex) => {
-    const extraOffBudget = Math.max(0, input.targetOff - input.fixedOff.size);
     input.fixedOff.forEach((day) => lockedOff.add(offKey(employeeIndex, day)));
   });
+  return lockedOff;
+}
+
+function buildSearchLockedOff(parsed: ParsedEmployeeInput[], lockedRecoveryOff: Set<string>) {
+  const lockedOff = buildInitialLockedOff(parsed);
+  lockedRecoveryOff.forEach((key) => lockedOff.add(key));
   return lockedOff;
 }
 
@@ -1242,8 +1247,6 @@ function buildTier1Diagnostics(
   removedM: number[],
   activeMDays: Set<number>,
   requestConflicts: string[],
-  forcedOffs: string[] = [],
-  forcedOffFailures: string[] = [],
 ) {
   const nightBlocks = buildNightBlocks(days.length);
   const blockMin = Math.floor(nightBlocks.length / EMPLOYEES.length);
@@ -1260,10 +1263,9 @@ function buildTier1Diagnostics(
     "3. Hard N balance rule: employee N block count range <= 1. N day count is not a hard balance rule.",
     `4. Required slot capacity: selected D/E/M+N slots ${selectedSlots}, regular capacity ${selectedCapacity}, all-M D/E/M+N slots ${allMSlots}`,
     `5. Removed weekend/holiday M days: ${removedM.length > 0 ? listDays([...removedM].sort((a, b) => a - b)) : "none"}. Weekday M compensation is optional after Tier 1.`,
-    `6. Forced OFF: ${forcedOffs.length > 0 ? forcedOffs.slice(0, 20).join(" / ") : "none"}`,
-    `7. Forced OFF failures: ${forcedOffFailures.length > 0 ? forcedOffFailures.join(" / ") : "none"}`,
-    `8. E/M -> D request conflicts: ${emDBlocked.length > 0 ? emDBlocked.join(" / ") : "none"}`,
-    `9. Request conflicts: ${requestConflicts.length > 0 ? requestConflicts.join(" / ") : "none"}`,
+    "6. Preventive generated OFF: skipped before D/E/M search; final OFF minimum is validated after search.",
+    `7. E/M -> D request conflicts: ${emDBlocked.length > 0 ? emDBlocked.join(" / ") : "none"}`,
+    `8. Request conflicts: ${requestConflicts.length > 0 ? requestConflicts.join(" / ") : "none"}`,
   ];
 }
 export function generateSchedule(
@@ -1293,16 +1295,10 @@ export function generateSchedule(
       ...duplicateRequestedShiftConflicts(parsed, days, activeMDays),
     ]),
   ];
-  const forcedOffPreviewSchedule = emptySchedule(days.length);
-  const nightPreview = assignNightBlocks(forcedOffPreviewSchedule, parsed, nightBlocks, variant);
-  const previewRequestFailures = nightPreview.ok ? fillRequests(nightPreview.schedule, parsed, slots, nightPreview.lockedRecoveryOff) : [];
-  const forcedOffPreview =
-    nightPreview.ok && previewRequestFailures.length === 0
-      ? reserveGeneratorOffs(nightPreview.schedule, parsed, days, activeMDays, variant, nightPreview.lockedRecoveryOff)
-      : { forcedOffs: [], failures: [...(nightPreview.ok ? [] : nightPreview.failures), ...previewRequestFailures] };
-  let lastForcedOffs = forcedOffPreview.forcedOffs;
-  let lastForcedOffFailures = forcedOffPreview.failures;
-  const diagnostics = () => buildTier1Diagnostics(days, parsed, slots, removedMDays, activeMDays, requestConflicts, lastForcedOffs, lastForcedOffFailures);
+  let lastNightAssignmentFailures: string[] = [];
+  let lastDemAssignmentFailures: string[] = [];
+  let sawFixedNightBlocks = false;
+  const diagnostics = () => buildTier1Diagnostics(days, parsed, slots, removedMDays, activeMDays, requestConflicts);
   if (hardOffCapacityFailures.length > 0) {
     return {
       ok: false,
@@ -1333,34 +1329,28 @@ export function generateSchedule(
     const maxWork = parsed.map((input) => days.length - input.minOff);
 
     let bestResult: { schedule: Schedule; score: number; stats: EmployeeStats[] } | null = null;
-    const seedAttempts = 24;
+    const seedAttempts = 48;
     for (let seed = 0; seed < seedAttempts; seed += 1) {
       const effectiveSeed = variant * 8 + seed;
       const nightAssignment = assignNightBlocks(emptySchedule(days.length), parsed, nightBlocks, effectiveSeed);
       if (!nightAssignment.ok) {
-        lastForcedOffFailures = nightAssignment.failures;
+        lastNightAssignmentFailures = nightAssignment.failures;
         continue;
       }
+      sawFixedNightBlocks = true;
       const schedule = nightAssignment.schedule;
       const requestFillFailures = fillRequests(schedule, parsed, slots, nightAssignment.lockedRecoveryOff);
       if (requestFillFailures.length > 0) {
-        lastForcedOffFailures = requestFillFailures;
+        lastDemAssignmentFailures = requestFillFailures;
         continue;
       }
       const duplicateFailure = validateHard(schedule, parsed, days, activeMDays).filter((failure) => failure.includes("work assigned on fixed OFF/vacation"));
-      if (duplicateFailure.length > 0) continue;
-      const { lockedOff, failures: offReservationFailures, forcedOffs } = reserveGeneratorOffs(
-        schedule,
-        parsed,
-        days,
-        activeMDays,
-        effectiveSeed,
-        nightAssignment.lockedRecoveryOff,
-      );
-      lastForcedOffs = forcedOffs;
-      lastForcedOffFailures = offReservationFailures;
-      if (offReservationFailures.length > 0) continue;
+      if (duplicateFailure.length > 0) {
+        lastDemAssignmentFailures = duplicateFailure;
+        continue;
+      }
 
+      const lockedOff = buildSearchLockedOff(parsed, nightAssignment.lockedRecoveryOff);
       const counts = recomputeCounts(schedule);
       const searchSlots = buildSearchSlots(slots, schedule, parsed, days);
       const attempt: Attempt = {
@@ -1368,7 +1358,7 @@ export function generateSchedule(
         lockedOff,
         ...counts,
         slotIndex: 0,
-        deadline: performance.now() + 2600,
+        deadline: performance.now() + 5000,
       };
       const calls = { count: 0 };
 
@@ -1384,6 +1374,8 @@ export function generateSchedule(
         }
         const balance = computeBalanceStats(stats);
         if (balance.dRange <= 1 && balance.eveningRange <= 1) break;
+      } else {
+        lastDemAssignmentFailures = ["Search exhausted before a valid D/E/M assignment was found."];
       }
     }
 
@@ -1405,7 +1397,8 @@ export function generateSchedule(
     ok: false,
     days,
     failures: [
-      "Tier 1 feasible schedule not found.",
+      sawFixedNightBlocks ? "D/E/M assignment failed after N blocks were fixed." : "Night block assignment failed.",
+      ...(sawFixedNightBlocks ? lastDemAssignmentFailures : lastNightAssignmentFailures),
       ...(removedM.size === 0 ? ["No weekend/holiday M shifts were removed."] : [`Removed ${removedM.size} M shifts on fixed OFF/vacation rest days. Weekday M compensation is optional.`]),
       ...diagnostics(),
     ],
