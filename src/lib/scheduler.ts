@@ -116,14 +116,11 @@ function emptySchedule(dayCount: number): Schedule {
   );
 }
 
-function requiredSlots(days: DayInfo[], activeMDays: Set<number>): Slot[] {
+function requiredSlots(days: DayInfo[]): Slot[] {
   const slots: Slot[] = [];
   days.forEach((day, index) => {
     slots.push({ dayIndex: index, code: "D" });
     slots.push({ dayIndex: index, code: "E" });
-    if (activeMDays.has(day.day)) {
-      slots.push({ dayIndex: index, code: "M" });
-    }
   });
   return slots;
 }
@@ -317,11 +314,11 @@ function canAssign(
   if (hasKnownPatternViolation(attempt.schedule, parsed, employeeIndex, slot.dayIndex, slot.code)) return false;
 
   const requested = normalizeShift(parsed[employeeIndex].requests.get(day));
-  if (requested && requested !== "OFF" && requested !== slot.code) return false;
+  if (requested && requested !== "OFF" && requested !== "M" && requested !== slot.code) return false;
   return true;
 }
 
-function requestImpossible(parsed: ParsedEmployeeInput[], days: DayInfo[], activeMDays: Set<number>) {
+function requestImpossible(parsed: ParsedEmployeeInput[], days: DayInfo[]) {
   const failures: string[] = [];
   parsed.forEach((input, index) => {
     const previous = previousTailFor(parsed, index);
@@ -333,12 +330,13 @@ function requestImpossible(parsed: ParsedEmployeeInput[], days: DayInfo[], activ
       const prev = shiftAt(dayIndex - 1);
       const prevPrev = shiftAt(dayIndex - 2);
       if (requested === null || requested === "OFF") return;
+      if (requested === "M") return;
       if (input.fixedOff.has(day)) failures.push(`${employee} day ${day} requested ${code}: conflicts with fixed OFF/vacation`);
       if (requested === "D" && isEveningLike(prev)) failures.push(`${employee} day ${day - 1} E/M -> day ${day} D`);
       if (requested !== "N" && prev === "N") failures.push(`${employee} day ${day} ${code}: N next day must be OFF or N`);
       if (requested !== "N" && prev === "N" && prevPrev === "N") failures.push(`${employee} day ${day} ${code}: after NN, OFF is required`);
       if (requested === "D" && isOffLike(prev) && prevPrev === "N") failures.push(`${employee} day ${day} D: N-O-D pattern is forbidden`);
-      const needed = activeMDays.has(day) ? ["D", "E", "M", "N"] : ["D", "E", "N"];
+      const needed = ["D", "E", "N"];
       if (!needed.includes(requested)) failures.push(`${employee} day ${day} ${code}: requested shift is not required on this day`);
     });
   });
@@ -407,7 +405,7 @@ function canAssignNightBlock(
       return `${employee} day ${day}: N shift intrudes into day ${day + 1} fixed OFF/vacation`;
     }
     const requested = normalizeShift(parsed[employeeIndex].requests.get(day));
-    if (requested && requested !== "N") return `${employee} day ${day}: requested ${requested} conflicts with N block`;
+    if (requested && requested !== "N" && requested !== "M") return `${employee} day ${day}: requested ${requested} conflicts with N block`;
     if (schedule[day - 1][employee] !== "/") return `${employee} day ${day}: already assigned`;
   }
 
@@ -426,7 +424,7 @@ function canAssignNightBlock(
   const recoveryDay = block.endDay + 1;
   if (recoveryDay <= schedule.length) {
     const requested = normalizeShift(parsed[employeeIndex].requests.get(recoveryDay));
-    if (requested && requested !== "OFF") {
+    if (requested && requested !== "OFF" && requested !== "M") {
       return `${employee} day ${recoveryDay}: recovery OFF conflicts with requested ${requested}`;
     }
   }
@@ -530,14 +528,14 @@ function buildSearchLockedOff(parsed: ParsedEmployeeInput[], lockedRecoveryOff: 
   return lockedOff;
 }
 
-function requiredShiftCountForDay(days: DayInfo[], day: number, activeMDays: Set<number>) {
-  return 3 + (activeMDays.has(day) ? 1 : 0);
+function requiredShiftCountForDay() {
+  return 3;
 }
 
-function dailyHardOffCapacityFailures(days: DayInfo[], parsed: ParsedEmployeeInput[], activeMDays: Set<number>) {
+function dailyHardOffCapacityFailures(days: DayInfo[], parsed: ParsedEmployeeInput[]) {
   const failures: string[] = [];
   days.forEach((dayInfo) => {
-    const requiredShiftCount = requiredShiftCountForDay(days, dayInfo.day, activeMDays);
+    const requiredShiftCount = requiredShiftCountForDay();
     const maxOff = EMPLOYEES.length - requiredShiftCount;
     const hardOffEmployees = EMPLOYEES.filter((_, employeeIndex) => parsed[employeeIndex].fixedOff.has(dayInfo.day));
     if (hardOffEmployees.length > maxOff) {
@@ -584,7 +582,7 @@ function canLockOff(
   if (day < 1 || day > schedule.length) return false;
   if (isLockedOff(lockedOff, employeeIndex, day)) return false;
   if (parsed[employeeIndex].requests.has(day)) return false;
-  if (lockedOffCountForDay(lockedOff, day) >= EMPLOYEES.length - requiredShiftCountForDay(days, day, removedM)) return false;
+  if (lockedOffCountForDay(lockedOff, day) >= EMPLOYEES.length - requiredShiftCountForDay()) return false;
   return schedule[day - 1][EMPLOYEES[employeeIndex]] === "/";
 }
 
@@ -618,7 +616,7 @@ function scoreOffCandidate(
   const dayOffPressure = lockedOffCountForDay(lockedOff, day) * 55;
   return (
     coveredRiskWindows * 120 -
-    requiredShiftCountForDay(days, day, removedM) * 10 +
+    requiredShiftCountForDay() * 10 +
     Math.min(nearestOffDistance, 6) * 3 +
     vacationBridge +
     exploration -
@@ -851,7 +849,6 @@ function search(
   searchSlots: Slot[],
   parsed: ParsedEmployeeInput[],
   days: DayInfo[],
-  activeMDays: Set<number>,
   maxWork: number[],
   calls: { count: number },
   seed: number,
@@ -859,7 +856,7 @@ function search(
   calls.count += 1;
   if (calls.count > MAX_ATTEMPTS || performance.now() > attempt.deadline) return false;
   if (attempt.slotIndex >= searchSlots.length) {
-    return validateHard(attempt.schedule, parsed, days, activeMDays).length === 0;
+    return validateHard(attempt.schedule, parsed, days).length === 0;
   }
 
   const slot = searchSlots[attempt.slotIndex];
@@ -874,7 +871,7 @@ function search(
     attempt.shiftCounts[employeeIndex][slot.code] += 1;
     attempt.slotIndex += 1;
 
-    if (search(attempt, searchSlots, parsed, days, activeMDays, maxWork, calls, seed)) return true;
+    if (search(attempt, searchSlots, parsed, days, maxWork, calls, seed)) return true;
 
     attempt.slotIndex -= 1;
     attempt.shiftCounts[employeeIndex][slot.code] -= 1;
@@ -884,7 +881,7 @@ function search(
   return false;
 }
 
-function validateHard(schedule: Schedule, parsed: ParsedEmployeeInput[], days: DayInfo[], activeMDays = new Set(days.filter((day) => day.isRestDay).map((day) => day.day))) {
+function validateHard(schedule: Schedule, parsed: ParsedEmployeeInput[], days: DayInfo[]) {
   const failures: string[] = [];
   const nightBlocks = buildNightBlocks(days.length);
   const blockMin = Math.floor(nightBlocks.length / EMPLOYEES.length);
@@ -964,8 +961,6 @@ function validateHard(schedule: Schedule, parsed: ParsedEmployeeInput[], days: D
     if (counts.D !== 1) failures.push(`${dayInfo.day} day D count ${counts.D}`);
     if (counts.E !== 1) failures.push(`${dayInfo.day} day E count ${counts.E}`);
     if (counts.N !== 1) failures.push(`${dayInfo.day} day N count ${counts.N}`);
-    if (activeMDays.has(dayInfo.day) && counts.M !== 1) failures.push(`${dayInfo.day} day M count ${counts.M}`);
-    if (!activeMDays.has(dayInfo.day) && counts.M !== 0) failures.push(`Day ${dayInfo.day}: M assigned on inactive M day`);
   });
   if (Math.min(...nightBlockCounts) < blockMin || Math.max(...nightBlockCounts) > blockMax) {
     failures.push(`Employee N block count range ${Math.min(...nightBlockCounts)}-${Math.max(...nightBlockCounts)} outside target ${blockMin}-${blockMax}`);
@@ -1057,7 +1052,7 @@ function tier2Score(schedule: Schedule, days: DayInfo[], parsed: ParsedEmployeeI
   return Math.round(score * 100) / 100;
 }
 
-function improve(schedule: Schedule, parsed: ParsedEmployeeInput[], days: DayInfo[], lockedOff: Set<string>, activeMDays: Set<number>) {
+function improve(schedule: Schedule, parsed: ParsedEmployeeInput[], days: DayInfo[], lockedOff: Set<string>) {
   let best = schedule.map((row) => ({ ...row })) as Schedule;
   let bestScore = tier2Score(best, days, parsed);
 
@@ -1077,7 +1072,7 @@ function improve(schedule: Schedule, parsed: ParsedEmployeeInput[], days: DayInf
           candidate[dayIndex][employeeA] = candidate[dayIndex][employeeB];
           candidate[dayIndex][employeeB] = temp;
           if (!respectsLockedOff(candidate, lockedOff)) continue;
-          if (validateHard(candidate, parsed, days, activeMDays).length > 0) continue;
+          if (validateHard(candidate, parsed, days).length > 0) continue;
 
           const score = tier2Score(candidate, days, parsed);
           if (score < passBestScore) {
@@ -1111,7 +1106,7 @@ function improve(schedule: Schedule, parsed: ParsedEmployeeInput[], days: DayInf
               candidate[secondDayIndex][employeeA] = candidate[secondDayIndex][employeeB];
               candidate[secondDayIndex][employeeB] = secondTemp;
               if (!respectsLockedOff(candidate, lockedOff)) continue;
-              if (validateHard(candidate, parsed, days, activeMDays).length > 0) continue;
+              if (validateHard(candidate, parsed, days).length > 0) continue;
 
               const score = tier2Score(candidate, days, parsed);
               if (score < passBestScore) {
@@ -1136,6 +1131,156 @@ function improve(schedule: Schedule, parsed: ParsedEmployeeInput[], days: DayInf
   return { schedule: best, score: bestScore };
 }
 
+type MPostProcessResult = {
+  schedule: Schedule;
+  removedM: number[];
+  desiredWeekendHolidayMCount: number;
+  assignedWeekendHolidayMCount: number;
+  removedWeekendHolidayMCount: number;
+  weekdayCompensationMCount: number;
+  uncompensatedMCount: number;
+  warnings: string[];
+};
+
+function currentMCount(schedule: Schedule, dayIndex: number) {
+  return EMPLOYEES.filter((employee) => schedule[dayIndex][employee] === "M").length;
+}
+
+function canTryAddM(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  lockedOff: Set<string>,
+  employeeIndex: number,
+  dayIndex: number,
+) {
+  const employee = EMPLOYEES[employeeIndex];
+  const day = dayIndex + 1;
+  if (schedule[dayIndex][employee] !== "/") return false;
+  if (isLockedOff(lockedOff, employeeIndex, day)) return false;
+  if (isFixedOff(parsed, employeeIndex, day)) return false;
+
+  const candidate = schedule.map((row) => ({ ...row })) as Schedule;
+  candidate[dayIndex][employee] = "M";
+  return validateHard(candidate, parsed, days).length === 0;
+}
+
+function scoreMCandidate(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  employeeIndex: number,
+  dayIndex: number,
+  seed: number,
+) {
+  const stats = computeStats(schedule, days)[employeeIndex];
+  const day = dayIndex + 1;
+  const requested = normalizeShift(parsed[employeeIndex].requests.get(day));
+  const exploration = ((employeeIndex * 19 + day * 23 + seed * 31) % 17) / 10;
+  return (
+    stats.totalWork * 14 +
+    stats.evening * 10 +
+    stats.holiday * (days[dayIndex].isHoliday ? 3 : 0) +
+    (requested === "M" ? -100 : 0) +
+    exploration
+  );
+}
+
+function addOneM(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  lockedOff: Set<string>,
+  dayIndex: number,
+  seed: number,
+) {
+  const employeeIndex = EMPLOYEES.map((_, index) => index)
+    .filter((index) => canTryAddM(schedule, parsed, days, lockedOff, index, dayIndex))
+    .sort((a, b) => scoreMCandidate(schedule, parsed, days, a, dayIndex, seed) - scoreMCandidate(schedule, parsed, days, b, dayIndex, seed))[0];
+  if (employeeIndex === undefined) return false;
+  schedule[dayIndex][EMPLOYEES[employeeIndex]] = "M";
+  return true;
+}
+
+function postProcessM(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  lockedOff: Set<string>,
+  desiredMDays: Set<number>,
+  initiallyRemovedMDays: number[],
+  seed: number,
+): MPostProcessResult {
+  const result = schedule.map((row) => ({ ...row })) as Schedule;
+  const removed = new Set(initiallyRemovedMDays);
+  let assignedWeekendHolidayMCount = 0;
+
+  [...desiredMDays].sort((a, b) => a - b).forEach((day) => {
+    const dayIndex = day - 1;
+    if (currentMCount(result, dayIndex) > 0 || addOneM(result, parsed, days, lockedOff, dayIndex, seed)) {
+      assignedWeekendHolidayMCount += 1;
+    } else {
+      removed.add(day);
+    }
+  });
+
+  let weekdayCompensationMCount = 0;
+  const weekdayIndexes = days
+    .map((dayInfo, index) => ({ dayInfo, index }))
+    .filter(({ dayInfo }) => !dayInfo.isRestDay)
+    .map(({ index }) => index);
+
+  [...removed].sort((a, b) => a - b).forEach((removedDay, offset) => {
+    const selectedDayIndex = weekdayIndexes
+      .filter((dayIndex) => currentMCount(result, dayIndex) === 0)
+      .filter((dayIndex) => EMPLOYEES.some((_, employeeIndex) => canTryAddM(result, parsed, days, lockedOff, employeeIndex, dayIndex)))
+      .sort((a, b) => {
+        const aBest = Math.min(
+          ...EMPLOYEES.map((_, employeeIndex) =>
+            canTryAddM(result, parsed, days, lockedOff, employeeIndex, a)
+              ? scoreMCandidate(result, parsed, days, employeeIndex, a, seed + removedDay + offset)
+              : Number.POSITIVE_INFINITY,
+          ),
+        );
+        const bBest = Math.min(
+          ...EMPLOYEES.map((_, employeeIndex) =>
+            canTryAddM(result, parsed, days, lockedOff, employeeIndex, b)
+              ? scoreMCandidate(result, parsed, days, employeeIndex, b, seed + removedDay + offset)
+              : Number.POSITIVE_INFINITY,
+          ),
+        );
+        return aBest - bBest || a - b;
+      })[0];
+    if (selectedDayIndex !== undefined && addOneM(result, parsed, days, lockedOff, selectedDayIndex, seed + removedDay + offset)) {
+      weekdayCompensationMCount += 1;
+    }
+  });
+
+  const desiredWeekendHolidayMCount = desiredMDays.size + initiallyRemovedMDays.length;
+  const removedWeekendHolidayMCount = removed.size;
+  const uncompensatedMCount = Math.max(0, removedWeekendHolidayMCount - weekdayCompensationMCount);
+  const warnings = [
+    `M service: desired weekend/holiday ${desiredWeekendHolidayMCount}, assigned weekend/holiday ${assignedWeekendHolidayMCount}, removed weekend/holiday ${removedWeekendHolidayMCount}, weekday compensation ${weekdayCompensationMCount}, uncompensated ${uncompensatedMCount}.`,
+  ];
+  if (removedWeekendHolidayMCount > 0) {
+    warnings.push(`Removed weekend/holiday M days: ${listDays([...removed].sort((a, b) => a - b))}.`);
+  }
+  if (uncompensatedMCount > 0) {
+    warnings.push(`${uncompensatedMCount} removed weekend/holiday M shift(s) could not be compensated on weekdays.`);
+  }
+
+  return {
+    schedule: result,
+    removedM: [...removed].sort((a, b) => a - b),
+    desiredWeekendHolidayMCount,
+    assignedWeekendHolidayMCount,
+    removedWeekendHolidayMCount,
+    weekdayCompensationMCount,
+    uncompensatedMCount,
+    warnings,
+  };
+}
+
 function listDays(days: number[]) {
   return days.length > 0 ? days.join(", ") : "none";
 }
@@ -1151,7 +1296,7 @@ function nPossibleDaysForEmployee(input: ParsedEmployeeInput, days: DayInfo[]) {
 
     if (input.fixedOff.has(day)) reason = "same-day fixed OFF/vacation";
     else if (input.fixedOff.has(day + 1)) reason = "next-day fixed OFF/vacation";
-    else if (nextRequest && nextRequest !== "N") reason = `next-day requested work ${nextRequest}`;
+    else if (nextRequest && nextRequest !== "N" && nextRequest !== "M") reason = `next-day requested work ${nextRequest}`;
     else if (input.requests.get(day - 1) === "N" && input.requests.get(day - 2) === "N") reason = "NNN is forbidden";
     else if (input.requests.get(day - 1) === "N" && input.requests.has(day + 1)) reason = "after NN, recovery OFF is unavailable";
 
@@ -1162,7 +1307,7 @@ function nPossibleDaysForEmployee(input: ParsedEmployeeInput, days: DayInfo[]) {
   return { possible, blocked };
 }
 
-function requestedShiftConflicts(parsed: ParsedEmployeeInput[], days: DayInfo[], activeMDays: Set<number>) {
+function requestedShiftConflicts(parsed: ParsedEmployeeInput[], days: DayInfo[]) {
   const conflicts: string[] = [];
   parsed.forEach((input, index) => {
     const employee = EMPLOYEES[index];
@@ -1173,8 +1318,9 @@ function requestedShiftConflicts(parsed: ParsedEmployeeInput[], days: DayInfo[],
       const dayIndex = day - 1;
       const prev = shiftAt(dayIndex - 1);
       const prevPrev = shiftAt(dayIndex - 2);
-      const needed = activeMDays.has(day) ? ["D", "E", "M", "N"] : ["D", "E", "N"];
+      const needed = ["D", "E", "N"];
       if (requested === null || requested === "OFF") return;
+      if (requested === "M") return;
 
       if (input.fixedOff.has(day)) conflicts.push(`${employee} day ${day} ${code}: conflicts with fixed OFF/vacation`);
       if (!needed.includes(requested)) conflicts.push(`${employee} day ${day} ${code}: requested shift is not required on this day`);
@@ -1187,14 +1333,13 @@ function requestedShiftConflicts(parsed: ParsedEmployeeInput[], days: DayInfo[],
   return [...new Set(conflicts)];
 }
 
-function duplicateRequestedShiftConflicts(parsed: ParsedEmployeeInput[], days: DayInfo[], activeMDays: Set<number>) {
+function duplicateRequestedShiftConflicts(parsed: ParsedEmployeeInput[], days: DayInfo[]) {
   const byDayShift = new Map<string, string[]>();
   parsed.forEach((input, employeeIndex) => {
     input.requests.forEach((code, day) => {
       const requested = normalizeShift(code);
-      if (requested !== "D" && requested !== "E" && requested !== "M") return;
+      if (requested !== "D" && requested !== "E") return;
       if (day < 1 || day > days.length) return;
-      if (requested === "M" && !activeMDays.has(day)) return;
       const key = `${day}:${requested}`;
       byDayShift.set(key, [...(byDayShift.get(key) ?? []), EMPLOYEES[employeeIndex]]);
     });
@@ -1244,15 +1389,11 @@ function buildTier1Diagnostics(
   days: DayInfo[],
   parsed: ParsedEmployeeInput[],
   slots: Slot[],
-  removedM: number[],
-  activeMDays: Set<number>,
   requestConflicts: string[],
 ) {
   const nightBlocks = buildNightBlocks(days.length);
   const blockMin = Math.floor(nightBlocks.length / EMPLOYEES.length);
   const blockMax = Math.ceil(nightBlocks.length / EMPLOYEES.length);
-  const allRestMDays = new Set(days.filter((day) => day.isRestDay).map((day) => day.day));
-  const allMSlots = requiredSlots(days, allRestMDays).length + days.length;
   const selectedSlots = slots.length + days.length;
   const selectedCapacity = regularOffProtectedCapacity(days, parsed);
   const emDBlocked = emToDBlockedDates(parsed);
@@ -1261,9 +1402,9 @@ function buildTier1Diagnostics(
     `1. Monthly N block count: ${nightBlocks.length}; employee target N block count: ${blockMin}${blockMin === blockMax ? "" : `-${blockMax}`}`,
     `2. N block structure: ${nightBlocks.map((block) => `${block.startDay}-${block.endDay}`).join(", ")}`,
     "3. Hard N balance rule: employee N block count range <= 1. N day count is not a hard balance rule.",
-    `4. Required slot capacity: selected D/E/M+N slots ${selectedSlots}, regular capacity ${selectedCapacity}, all-M D/E/M+N slots ${allMSlots}`,
-    `5. Removed weekend/holiday M days: ${removedM.length > 0 ? listDays([...removedM].sort((a, b) => a - b)) : "none"}. Weekday M compensation is optional after Tier 1.`,
-    "6. Preventive generated OFF: skipped before D/E/M search; final OFF minimum is validated after search.",
+    `4. Required core slots: D/E+N ${selectedSlots}, regular capacity ${selectedCapacity}.`,
+    "5. M service is deferred until after a valid D/E+N core schedule is found.",
+    "6. Preventive generated OFF: skipped before D/E search; final OFF minimum is validated after search.",
     `7. E/M -> D request conflicts: ${emDBlocked.length > 0 ? emDBlocked.join(" / ") : "none"}`,
     `8. Request conflicts: ${requestConflicts.length > 0 ? requestConflicts.join(" / ") : "none"}`,
   ];
@@ -1284,21 +1425,20 @@ export function generateSchedule(
     return parsedInput;
   });
   const { activeMDays, removedM: removedMDays } = activeMDaysForMonth(days, parsed);
-  const removedM = new Set(removedMDays);
-  const slots = requiredSlots(days, activeMDays);
+  const slots = requiredSlots(days);
   const nightBlocks = buildNightBlocks(days.length);
-  const hardOffCapacityFailures = dailyHardOffCapacityFailures(days, parsed, activeMDays);
+  const hardOffCapacityFailures = dailyHardOffCapacityFailures(days, parsed);
   const requestConflicts = [
     ...new Set([
-      ...requestImpossible(parsed, days, activeMDays),
-      ...requestedShiftConflicts(parsed, days, activeMDays),
-      ...duplicateRequestedShiftConflicts(parsed, days, activeMDays),
+      ...requestImpossible(parsed, days),
+      ...requestedShiftConflicts(parsed, days),
+      ...duplicateRequestedShiftConflicts(parsed, days),
     ]),
   ];
   let lastNightAssignmentFailures: string[] = [];
   let lastDemAssignmentFailures: string[] = [];
   let sawFixedNightBlocks = false;
-  const diagnostics = () => buildTier1Diagnostics(days, parsed, slots, removedMDays, activeMDays, requestConflicts);
+  const diagnostics = () => buildTier1Diagnostics(days, parsed, slots, requestConflicts);
   if (hardOffCapacityFailures.length > 0) {
     return {
       ok: false,
@@ -1328,7 +1468,7 @@ export function generateSchedule(
   if (totalCapacity >= minOffTotal) {
     const maxWork = parsed.map((input) => days.length - input.minOff);
 
-    let bestResult: { schedule: Schedule; score: number; stats: EmployeeStats[] } | null = null;
+    let bestResult: { schedule: Schedule; score: number; stats: EmployeeStats[]; mPostProcess: MPostProcessResult } | null = null;
     const seedAttempts = 48;
     for (let seed = 0; seed < seedAttempts; seed += 1) {
       const effectiveSeed = variant * 8 + seed;
@@ -1344,7 +1484,7 @@ export function generateSchedule(
         lastDemAssignmentFailures = requestFillFailures;
         continue;
       }
-      const duplicateFailure = validateHard(schedule, parsed, days, activeMDays).filter((failure) => failure.includes("work assigned on fixed OFF/vacation"));
+      const duplicateFailure = validateHard(schedule, parsed, days).filter((failure) => failure.includes("work assigned on fixed OFF/vacation"));
       if (duplicateFailure.length > 0) {
         lastDemAssignmentFailures = duplicateFailure;
         continue;
@@ -1362,32 +1502,36 @@ export function generateSchedule(
       };
       const calls = { count: 0 };
 
-      if (search(attempt, searchSlots, parsed, days, activeMDays, maxWork, calls, effectiveSeed)) {
-        const improved = improve(attempt.schedule, parsed, days, lockedOff, activeMDays);
-        const stats = computeStats(improved.schedule, days);
-        if (!bestResult || improved.score < bestResult.score) {
+      if (search(attempt, searchSlots, parsed, days, maxWork, calls, effectiveSeed)) {
+        const improved = improve(attempt.schedule, parsed, days, lockedOff);
+        const withM = postProcessM(improved.schedule, parsed, days, lockedOff, activeMDays, removedMDays, effectiveSeed);
+        const stats = computeStats(withM.schedule, days);
+        const score = tier2Score(withM.schedule, days, parsed);
+        if (!bestResult || score < bestResult.score) {
           bestResult = {
-            schedule: improved.schedule,
-            score: improved.score,
+            schedule: withM.schedule,
+            score,
             stats,
+            mPostProcess: withM,
           };
         }
         const balance = computeBalanceStats(stats);
         if (balance.dRange <= 1 && balance.eveningRange <= 1) break;
       } else {
-        lastDemAssignmentFailures = ["Search exhausted before a valid D/E/M assignment was found."];
+        lastDemAssignmentFailures = ["Search exhausted before a valid D/E assignment was found."];
       }
     }
 
     if (bestResult) {
+      const stats = computeStats(bestResult.schedule, days);
       return {
         ok: true,
         schedule: bestResult.schedule,
         days,
-        stats: bestResult.stats,
-        balance: computeBalanceStats(bestResult.stats),
-        removedM: [...removedM].sort((a, b) => a - b),
-        warnings: removedM.size > 0 ? [`Removed M shifts on fixed OFF/vacation rest days: ${[...removedM].sort((a, b) => a - b).join(", ")}. Weekday M compensation is optional after Tier 1.`] : [],
+        stats,
+        balance: computeBalanceStats(stats),
+        removedM: bestResult.mPostProcess.removedM,
+        warnings: bestResult.mPostProcess.warnings,
         score: bestResult.score,
       };
     }
@@ -1397,9 +1541,8 @@ export function generateSchedule(
     ok: false,
     days,
     failures: [
-      sawFixedNightBlocks ? "D/E/M assignment failed after N blocks were fixed." : "Night block assignment failed.",
+      sawFixedNightBlocks ? "D/E assignment failed after N blocks were fixed." : "Night block assignment failed.",
       ...(sawFixedNightBlocks ? lastDemAssignmentFailures : lastNightAssignmentFailures),
-      ...(removedM.size === 0 ? ["No weekend/holiday M shifts were removed."] : [`Removed ${removedM.size} M shifts on fixed OFF/vacation rest days. Weekday M compensation is optional.`]),
       ...diagnostics(),
     ],
   };
