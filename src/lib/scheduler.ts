@@ -20,6 +20,17 @@ type NightBlock = { startDay: number; endDay: number; days: number[]; length: 2 
 type NightAssignmentResult =
   | { ok: true; schedule: Schedule; lockedRecoveryOff: Set<string>; blockCounts: number[] }
   | { ok: false; failures: string[] };
+type NightSearchDiagnostics = {
+  nodesVisited: number;
+  deepestDepth: number;
+  deepestCounts: number[];
+  mostConstrained?: {
+    block: NightBlock;
+    candidates: number[];
+    rejected: { employee: Employee; reason: string }[];
+  };
+  rejectionReasons: string[];
+};
 type Attempt = {
   schedule: Schedule;
   lockedOff: Set<string>;
@@ -420,33 +431,55 @@ function blockRequestOwner(block: NightBlock, parsed: ParsedEmployeeInput[]) {
   return owners;
 }
 
+function blockStartIndex(block: NightBlock) {
+  return block.startDay - 1;
+}
+
+function blockEndIndex(block: NightBlock) {
+  return block.endDay - 1;
+}
+
+function nightBlocksTooClose(a: NightBlock, b: NightBlock) {
+  const earlier = blockStartIndex(a) <= blockStartIndex(b) ? a : b;
+  const later = earlier === a ? b : a;
+  return blockStartIndex(later) - blockEndIndex(earlier) < 7;
+}
+
+function assignedBlocksForEmployee(schedule: Schedule, blocks: NightBlock[], employeeIndex: number) {
+  const employee = EMPLOYEES[employeeIndex];
+  return blocks.filter((block) => block.days.every((day) => schedule[day - 1][employee] === "N"));
+}
+
 function canAssignNightBlock(
   schedule: Schedule,
   parsed: ParsedEmployeeInput[],
+  blocks: NightBlock[],
   block: NightBlock,
   employeeIndex: number,
   blockCounts: number[],
   blockMax: number,
+  forcedOwner?: number,
 ) {
   const employee = EMPLOYEES[employeeIndex];
+  if (forcedOwner !== undefined && forcedOwner !== employeeIndex) return `${employee}: requested N forces this block to ${EMPLOYEES[forcedOwner]}`;
   if (blockCounts[employeeIndex] + 1 > blockMax) return `${employee}: N block count target exceeded`;
   for (const day of block.days) {
     if (parsed[employeeIndex].fixedOff.has(day)) return `${employee} day ${day}: N block day fixedOff/vacation/wantedOff`;
     const requested = normalizeShift(parsed[employeeIndex].requests.get(day));
-    if (requested && requested !== "N" && requested !== "M") return `${employee} day ${day}: requested ${requested} conflicts with N block`;
+    if (requested && requested !== "N") return `${employee} day ${day}: requested incompatible ${requested}`;
     if (schedule[day - 1][employee] !== "/") return `${employee} day ${day}: already assigned`;
   }
 
   const shiftAt = (dayIndex: number) => getShiftAtWithPrev(schedule, parsed, dayIndex, employeeIndex);
   const previousLimit = -previousTailFor(parsed, employeeIndex).length;
-  const startIndex = block.startDay - 1;
+  const startIndex = blockStartIndex(block);
   if (nightSpacingViolation(shiftAt, startIndex, "N", previousLimit)) {
     return `${employee} day ${block.startDay}: previous-month night spacing conflict`;
   }
 
-  const previousCurrentNightEnd = previousNightEndIndex(shiftAt, startIndex, 0);
-  if (previousCurrentNightEnd !== null && startIndex - previousCurrentNightEnd < 7) {
-    return `${employee} day ${block.startDay}: night block spacing conflict`;
+  const closeBlock = assignedBlocksForEmployee(schedule, blocks, employeeIndex).find((assignedBlock) => nightBlocksTooClose(assignedBlock, block));
+  if (closeBlock) {
+    return `${employee} ${block.startDay}-${block.endDay}: current-month N spacing conflict with ${closeBlock.startDay}-${closeBlock.endDay}`;
   }
 
   const recoveryDay = block.endDay + 1;
@@ -468,17 +501,66 @@ function canNightCountsStillBalance(blockCounts: number[], assignedBlocks: numbe
   return true;
 }
 
+function compatibleRemainingCountForEmployee(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  blocks: NightBlock[],
+  unassignedBlockIndexes: number[],
+  employeeIndex: number,
+  blockCounts: number[],
+  blockMax: number,
+  forcedOwners: Map<number, number>,
+) {
+  return unassignedBlockIndexes.filter((blockIndex) => {
+    const forcedOwner = forcedOwners.get(blockIndex);
+    return !canAssignNightBlock(schedule, parsed, blocks, blocks[blockIndex], employeeIndex, blockCounts, blockMax, forcedOwner);
+  }).length;
+}
+
+function canNightCountsStillReachTargets(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  blocks: NightBlock[],
+  unassignedBlockIndexes: number[],
+  blockCounts: number[],
+  blockMin: number,
+  blockMax: number,
+  forcedOwners: Map<number, number>,
+) {
+  if (blockCounts.some((count) => count > blockMax)) return false;
+  const neededToReachMin = blockCounts.reduce((sum, count) => sum + Math.max(0, blockMin - count), 0);
+  if (neededToReachMin > unassignedBlockIndexes.length) return false;
+  return EMPLOYEES.every((_, employeeIndex) => {
+    const needed = Math.max(0, blockMin - blockCounts[employeeIndex]);
+    if (needed === 0) return true;
+    return (
+      compatibleRemainingCountForEmployee(
+        schedule,
+        parsed,
+        blocks,
+        unassignedBlockIndexes,
+        employeeIndex,
+        blockCounts,
+        blockMax,
+        forcedOwners,
+      ) >= needed
+    );
+  });
+}
+
 function summarizeNightBlockCandidates(
   schedule: Schedule,
   parsed: ParsedEmployeeInput[],
   blocks: NightBlock[],
   blockCounts: number[],
   blockMax: number,
+  forcedOwners = new Map<number, number>(),
 ) {
-  const summaries = blocks.map((block) => {
+  const summaries = blocks.map((block, blockIndex) => {
+    const forcedOwner = forcedOwners.get(blockIndex);
     const rejected = EMPLOYEES.map((employee, employeeIndex) => ({
       employee,
-      reason: canAssignNightBlock(schedule, parsed, block, employeeIndex, blockCounts, blockMax),
+      reason: canAssignNightBlock(schedule, parsed, blocks, block, employeeIndex, blockCounts, blockMax, forcedOwner),
     }));
     const eligible = rejected.filter((item) => !item.reason).map((item) => item.employee);
     return { block, eligible, rejected: rejected.filter((item): item is { employee: Employee; reason: string } => Boolean(item.reason)) };
@@ -519,32 +601,6 @@ function summarizeNightBlockCandidates(
   ];
 }
 
-function hasBasicDEFeasibility(
-  schedule: Schedule,
-  parsed: ParsedEmployeeInput[],
-  days: DayInfo[],
-  lockedRecoveryOff: Set<string>,
-) {
-  const lockedOff = buildSearchLockedOff(parsed, lockedRecoveryOff);
-  const counts = recomputeCounts(schedule);
-  const maxWork = parsed.map((input) => days.length - input.minOff);
-  const attempt: Attempt = {
-    schedule,
-    lockedOff,
-    ...counts,
-    slotIndex: 0,
-    deadline: Number.POSITIVE_INFINITY,
-  };
-
-  return days.every((_, dayIndex) => {
-    const dSlot: Slot = { dayIndex, code: "D" };
-    const eSlot: Slot = { dayIndex, code: "E" };
-    const dCandidates = EMPLOYEES.map((__, index) => index).filter((index) => canAssign(attempt, parsed, dSlot, index, maxWork));
-    const eCandidates = EMPLOYEES.map((__, index) => index).filter((index) => canAssign(attempt, parsed, eSlot, index, maxWork));
-    return dCandidates.some((dIndex) => eCandidates.some((eIndex) => eIndex !== dIndex));
-  });
-}
-
 function assignNightBlocks(
   baseSchedule: Schedule,
   parsed: ParsedEmployeeInput[],
@@ -559,6 +615,13 @@ function assignNightBlocks(
   const lockedRecoveryOff = new Set<string>();
   const failures: string[] = [];
   const forcedOwners = new Map<number, number>();
+  const assignedBlockIndexes = new Set<number>();
+  const diagnostics: NightSearchDiagnostics = {
+    nodesVisited: 0,
+    deepestDepth: 0,
+    deepestCounts: [...blockCounts],
+    rejectionReasons: [],
+  };
 
   blocks.forEach((block, blockIndex) => {
     const owners = blockRequestOwner(block, parsed);
@@ -570,37 +633,102 @@ function assignNightBlocks(
       forcedOwners.set(blockIndex, [...owners][0]);
     }
   });
-  if (failures.length > 0) return { ok: false, failures };
 
-  const dfs = (orderIndex: number): boolean => {
-    if (orderIndex >= blocks.length) {
+  const formatNightDiagnostics = () => {
+    const unassignedBlockIndexes = blocks.map((_, index) => index).filter((index) => !assignedBlockIndexes.has(index));
+    const mostConstrained =
+      diagnostics.mostConstrained ??
+      unassignedBlockIndexes
+        .map((blockIndex) => candidateSummaryForBlock(blockIndex))
+        .sort((a, b) => a.candidates.length - b.candidates.length || a.block.startDay - b.block.startDay)[0];
+    const topReasons = commonFailureSummary("Top N rejection reasons", diagnostics.rejectionReasons);
+    return [
+      `N recursive nodes visited: ${diagnostics.nodesVisited}.`,
+      `Deepest N recursion depth: ${diagnostics.deepestDepth}.`,
+      `N block counts at deepest failure: ${EMPLOYEES.map((employee, index) => `${employee}:${diagnostics.deepestCounts[index]}`).join(", ")}.`,
+      ...(mostConstrained
+        ? [
+            `Most constrained unresolved N block: ${mostConstrained.block.startDay}-${mostConstrained.block.endDay}.`,
+            `Dynamic candidates for that block: ${
+              mostConstrained.candidates.length > 0 ? mostConstrained.candidates.map((index) => EMPLOYEES[index]).join(", ") : "none"
+            }.`,
+            `Rejections for that block: ${
+              mostConstrained.rejected.length > 0
+                ? mostConstrained.rejected.map(({ employee, reason }) => `${employee}=${reason}`).join("; ")
+                : "none"
+            }.`,
+          ]
+        : []),
+      ...topReasons,
+    ];
+  };
+
+  const candidateSummaryForBlock = (blockIndex: number) => {
+    const block = blocks[blockIndex];
+    const forcedOwner = forcedOwners.get(blockIndex);
+    const rejected = EMPLOYEES.map((employee, employeeIndex) => ({
+      employee,
+      reason: canAssignNightBlock(schedule, parsed, blocks, block, employeeIndex, blockCounts, blockMax, forcedOwner),
+    }));
+    return {
+      block,
+      candidates: rejected.filter((item) => !item.reason).map((item) => EMPLOYEES.indexOf(item.employee)),
+      rejected: rejected.filter((item): item is { employee: Employee; reason: string } => Boolean(item.reason)),
+    };
+  };
+
+  if (failures.length > 0) {
+    const candidateDiagnostics = summarizeNightBlockCandidates(baseSchedule, parsed, blocks, EMPLOYEES.map(() => 0), blockMax, forcedOwners);
+    return { ok: false, failures: [...failures, ...formatNightDiagnostics(), ...candidateDiagnostics] };
+  }
+
+  const dfs = (): boolean => {
+    diagnostics.nodesVisited += 1;
+    const depth = assignedBlockIndexes.size;
+    if (depth > diagnostics.deepestDepth) {
+      diagnostics.deepestDepth = depth;
+      diagnostics.deepestCounts = [...blockCounts];
+    }
+
+    if (assignedBlockIndexes.size >= blocks.length) {
       return Math.min(...blockCounts) >= blockMin && Math.max(...blockCounts) <= blockMax;
     }
-    if (!canNightCountsStillBalance(blockCounts, orderIndex, blocks.length, blockMin, blockMax)) {
+
+    const unassignedBlockIndexes = blocks.map((_, index) => index).filter((index) => !assignedBlockIndexes.has(index));
+    if (!canNightCountsStillBalance(blockCounts, assignedBlockIndexes.size, blocks.length, blockMin, blockMax)) {
       failures.push("N block count balance impossible");
       return false;
     }
+    if (!canNightCountsStillReachTargets(schedule, parsed, blocks, unassignedBlockIndexes, blockCounts, blockMin, blockMax, forcedOwners)) {
+      failures.push("N block count target cannot be reached from remaining compatible blocks");
+      return false;
+    }
 
-    const remaining = blocks
-      .map((block, index) => ({ block, index }))
-      .filter(({ block }) => !block.days.some((day) => EMPLOYEES.some((employee) => schedule[day - 1][employee] === "N")))
-      .map(({ block, index }) => ({
-        block,
-        index,
-        forced: forcedOwners.has(index),
-        eligibleCount: EMPLOYEES.filter((_, employeeIndex) => !canAssignNightBlock(schedule, parsed, block, employeeIndex, blockCounts, blockMax)).length,
-      }))
+    const remaining = unassignedBlockIndexes
+      .map((index) => {
+        const summary = candidateSummaryForBlock(index);
+        summary.rejected.forEach(({ reason }) => diagnostics.rejectionReasons.push(reason));
+        return {
+          ...summary,
+          index,
+          forced: forcedOwners.has(index),
+        };
+      })
       .sort(
         (a, b) =>
+          a.candidates.length - b.candidates.length ||
           Number(b.forced) - Number(a.forced) ||
-          a.eligibleCount - b.eligibleCount ||
-          seededNoise(seed, a.index, a.block.startDay) - seededNoise(seed, b.index, b.block.startDay) ||
+          seededNoise(seed, a.index, a.block.startDay, diagnostics.nodesVisited) -
+            seededNoise(seed, b.index, b.block.startDay, diagnostics.nodesVisited) ||
           a.block.startDay - b.block.startDay,
       );
 
-    const { block, index } = remaining[0];
-    const forcedOwner = forcedOwners.get(index);
-    const candidates = forcedOwner !== undefined ? [forcedOwner] : EMPLOYEES.map((_, employeeIndex) => employeeIndex);
+    const selected = remaining[0];
+    diagnostics.mostConstrained = selected;
+    if (selected.candidates.length === 0) return false;
+
+    const { block, index } = selected;
+    const candidates = [...selected.candidates];
     candidates.sort(
       (a, b) =>
         blockCounts[a] - blockCounts[b] ||
@@ -608,28 +736,28 @@ function assignNightBlocks(
     );
 
     for (const employeeIndex of candidates) {
-      const reason = canAssignNightBlock(schedule, parsed, block, employeeIndex, blockCounts, blockMax);
-      if (reason) {
-        if (forcedOwner !== undefined) failures.push(reason);
-        continue;
-      }
+      const reason = canAssignNightBlock(schedule, parsed, blocks, block, employeeIndex, blockCounts, blockMax, forcedOwners.get(index));
+      if (reason) continue;
       const employee = EMPLOYEES[employeeIndex];
       block.days.forEach((day) => {
         schedule[day - 1][employee] = "N";
       });
       blockCounts[employeeIndex] += 1;
+      assignedBlockIndexes.add(index);
       const recoveryDay = block.endDay + 1;
       if (recoveryDay <= schedule.length) lockedRecoveryOff.add(offKey(employeeIndex, recoveryDay));
 
+      const nextUnassigned = blocks.map((_, blockIndex) => blockIndex).filter((blockIndex) => !assignedBlockIndexes.has(blockIndex));
       if (
-        canNightCountsStillBalance(blockCounts, orderIndex + 1, blocks.length, blockMin, blockMax) &&
-        hasBasicDEFeasibility(schedule, parsed, days, lockedRecoveryOff) &&
-        dfs(orderIndex + 1)
+        canNightCountsStillBalance(blockCounts, assignedBlockIndexes.size, blocks.length, blockMin, blockMax) &&
+        canNightCountsStillReachTargets(schedule, parsed, blocks, nextUnassigned, blockCounts, blockMin, blockMax, forcedOwners) &&
+        dfs()
       ) {
         return true;
       }
 
       if (recoveryDay <= schedule.length) lockedRecoveryOff.delete(offKey(employeeIndex, recoveryDay));
+      assignedBlockIndexes.delete(index);
       blockCounts[employeeIndex] -= 1;
       block.days.forEach((day) => {
         schedule[day - 1][employee] = "/";
@@ -638,12 +766,13 @@ function assignNightBlocks(
     return false;
   };
 
-  if (!dfs(0)) {
-    const candidateDiagnostics = summarizeNightBlockCandidates(baseSchedule, parsed, blocks, EMPLOYEES.map(() => 0), blockMax);
+  if (!dfs()) {
+    const candidateDiagnostics = summarizeNightBlockCandidates(baseSchedule, parsed, blocks, EMPLOYEES.map(() => 0), blockMax, forcedOwners);
     return {
       ok: false,
       failures: [
         ...(failures.length > 0 ? [...new Set(failures)] : ["Unable to assign N blocks with spacing, recovery OFF, and block-count balance"]),
+        ...formatNightDiagnostics(),
         ...candidateDiagnostics,
       ],
     };
