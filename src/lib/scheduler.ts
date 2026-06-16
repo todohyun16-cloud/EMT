@@ -43,6 +43,8 @@ type Attempt = {
 const SHIFTS: WorkShift[] = ["D", "E", "M", "N"];
 const MAX_ATTEMPTS = 260000;
 const SLOT_PRIORITY: Record<WorkShift, number> = { N: 0, D: 1, E: 2, M: 3 };
+const MIN_NON_N_DAYS_BETWEEN_N_BLOCKS = 4;
+const MIN_N_BLOCK_START_GAP = MIN_NON_N_DAYS_BETWEEN_N_BLOCKS + 1;
 
 function seededNoise(seed: number, ...values: number[]) {
   let hash = seed + 0x9e3779b9;
@@ -287,7 +289,7 @@ function nightSpacingViolation(
   if (code !== "N") return false;
   if (dayIndex > 0 && getShiftAt(dayIndex - 1) === "N") return false;
   const previousNightEnd = previousNightEndIndex(getShiftAt, dayIndex, previousLimit);
-  return previousNightEnd !== null && dayIndex - previousNightEnd < 7;
+  return previousNightEnd !== null && dayIndex - previousNightEnd < MIN_N_BLOCK_START_GAP;
 }
 
 function shiftWithCandidate(
@@ -442,7 +444,7 @@ function blockEndIndex(block: NightBlock) {
 function nightBlocksTooClose(a: NightBlock, b: NightBlock) {
   const earlier = blockStartIndex(a) <= blockStartIndex(b) ? a : b;
   const later = earlier === a ? b : a;
-  return blockStartIndex(later) - blockEndIndex(earlier) < 7;
+  return blockStartIndex(later) - blockEndIndex(earlier) < MIN_N_BLOCK_START_GAP;
 }
 
 function assignedBlocksForEmployee(schedule: Schedule, blocks: NightBlock[], employeeIndex: number) {
@@ -474,12 +476,12 @@ function canAssignNightBlock(
   const previousLimit = -previousTailFor(parsed, employeeIndex).length;
   const startIndex = blockStartIndex(block);
   if (nightSpacingViolation(shiftAt, startIndex, "N", previousLimit)) {
-    return `${employee} day ${block.startDay}: previous-month night spacing conflict`;
+    return `${employee} day ${block.startDay}: night spacing conflict: requires at least ${MIN_NON_N_DAYS_BETWEEN_N_BLOCKS} non-N days between N blocks`;
   }
 
   const closeBlock = assignedBlocksForEmployee(schedule, blocks, employeeIndex).find((assignedBlock) => nightBlocksTooClose(assignedBlock, block));
   if (closeBlock) {
-    return `${employee} ${block.startDay}-${block.endDay}: current-month N spacing conflict with ${closeBlock.startDay}-${closeBlock.endDay}`;
+    return `${employee} ${block.startDay}-${block.endDay}: night spacing conflict: requires at least ${MIN_NON_N_DAYS_BETWEEN_N_BLOCKS} non-N days between N blocks; conflicts with ${closeBlock.startDay}-${closeBlock.endDay}`;
   }
 
   const recoveryDay = block.endDay + 1;
@@ -1216,7 +1218,11 @@ function validateHard(schedule: Schedule, parsed: ParsedEmployeeInput[], days: D
       if (dayIndex >= 2 && current === "N" && prev === "N" && prevPrev === "N" && !isAllowedFinalNnn) failures.push(`${employee} day ${day}: NNN pattern is forbidden`);
       else if (prev === "N" && prevPrev === "N" && !isOffLike(current) && current !== "N") failures.push(`${employee} day ${day}: after NN, ${current} is forbidden`);
       if (current === "D" && isOffLike(prev) && prevPrev === "N") failures.push(`${employee} day ${day}: N-O-D pattern is forbidden`);
-      if (nightSpacingViolation(shiftAt, dayIndex, current, previousLimit)) failures.push(`${employee} day ${day}: night block spacing is less than 6 non-N days`);
+      if (nightSpacingViolation(shiftAt, dayIndex, current, previousLimit)) {
+        failures.push(
+          `${employee} day ${day}: night spacing conflict: requires at least ${MIN_NON_N_DAYS_BETWEEN_N_BLOCKS} non-N days between N blocks`,
+        );
+      }
     }
     const offCount = schedule.filter((row) => row[employee] === "/").length;
     if (offCount < parsed[employeeIndex].minOff) failures.push(`${employee}: OFF count ${offCount} is below minimum ${parsed[employeeIndex].minOff}`);
