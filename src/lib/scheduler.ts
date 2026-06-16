@@ -33,6 +33,15 @@ const SHIFTS: WorkShift[] = ["D", "E", "M", "N"];
 const MAX_ATTEMPTS = 260000;
 const SLOT_PRIORITY: Record<WorkShift, number> = { N: 0, D: 1, E: 2, M: 3 };
 
+function seededNoise(seed: number, ...values: number[]) {
+  let hash = seed + 0x9e3779b9;
+  values.forEach((value) => {
+    hash ^= value + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash |= 0;
+  });
+  return Math.abs(hash % 100000) / 100000;
+}
+
 function normalizeShift(code: unknown): NormalizedShift | null {
   if (code === null || code === undefined) return null;
   const normalized = String(code).normalize("NFKC").trim().toUpperCase().replace(/\s+/g, "");
@@ -318,6 +327,28 @@ function canAssign(
   return true;
 }
 
+function canAssignReason(
+  attempt: Attempt,
+  parsed: ParsedEmployeeInput[],
+  slot: Slot,
+  employeeIndex: number,
+  maxWork: number[],
+) {
+  const employee = EMPLOYEES[employeeIndex];
+  const day = slot.dayIndex + 1;
+  if (attempt.schedule[slot.dayIndex][employee] !== "/") return "already assigned";
+  if (isLockedOff(attempt.lockedOff, employeeIndex, day)) return "locked OFF";
+  if (isFixedOff(parsed, employeeIndex, day)) return "fixed OFF/vacation/wantedOff";
+  if (attempt.workCounts[employeeIndex] + 1 > maxWork[employeeIndex]) return "minOff capacity";
+  if (wouldExceedConsecutive(attempt.schedule, parsed, employeeIndex, slot.dayIndex, slot.code)) return "max 5 consecutive work";
+  const pattern = hasKnownPatternViolation(attempt.schedule, parsed, employeeIndex, slot.dayIndex, slot.code);
+  if (pattern) return pattern;
+
+  const requested = normalizeShift(parsed[employeeIndex].requests.get(day));
+  if (requested && requested !== "OFF" && requested !== "M" && requested !== slot.code) return `requested ${requested}`;
+  return null;
+}
+
 function requestImpossible(parsed: ParsedEmployeeInput[], days: DayInfo[]) {
   const failures: string[] = [];
   parsed.forEach((input, index) => {
@@ -432,10 +463,37 @@ function canAssignNightBlock(
   return null;
 }
 
+function hasBasicDEFeasibility(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  lockedRecoveryOff: Set<string>,
+) {
+  const lockedOff = buildSearchLockedOff(parsed, lockedRecoveryOff);
+  const counts = recomputeCounts(schedule);
+  const maxWork = parsed.map((input) => days.length - input.minOff);
+  const attempt: Attempt = {
+    schedule,
+    lockedOff,
+    ...counts,
+    slotIndex: 0,
+    deadline: Number.POSITIVE_INFINITY,
+  };
+
+  return days.every((_, dayIndex) => {
+    const dSlot: Slot = { dayIndex, code: "D" };
+    const eSlot: Slot = { dayIndex, code: "E" };
+    const dCandidates = EMPLOYEES.map((__, index) => index).filter((index) => canAssign(attempt, parsed, dSlot, index, maxWork));
+    const eCandidates = EMPLOYEES.map((__, index) => index).filter((index) => canAssign(attempt, parsed, eSlot, index, maxWork));
+    return dCandidates.some((dIndex) => eCandidates.some((eIndex) => eIndex !== dIndex));
+  });
+}
+
 function assignNightBlocks(
   baseSchedule: Schedule,
   parsed: ParsedEmployeeInput[],
   blocks: NightBlock[],
+  days: DayInfo[],
   seed: number,
 ): NightAssignmentResult {
   const schedule = baseSchedule.map((row) => ({ ...row })) as Schedule;
@@ -472,12 +530,22 @@ function assignNightBlocks(
         forced: forcedOwners.has(index),
         eligibleCount: EMPLOYEES.filter((_, employeeIndex) => !canAssignNightBlock(schedule, parsed, block, employeeIndex, blockCounts, blockMax)).length,
       }))
-      .sort((a, b) => Number(b.forced) - Number(a.forced) || a.eligibleCount - b.eligibleCount || a.block.startDay - b.block.startDay);
+      .sort(
+        (a, b) =>
+          Number(b.forced) - Number(a.forced) ||
+          a.eligibleCount - b.eligibleCount ||
+          seededNoise(seed, a.index, a.block.startDay) - seededNoise(seed, b.index, b.block.startDay) ||
+          a.block.startDay - b.block.startDay,
+      );
 
     const { block, index } = remaining[0];
     const forcedOwner = forcedOwners.get(index);
     const candidates = forcedOwner !== undefined ? [forcedOwner] : EMPLOYEES.map((_, employeeIndex) => employeeIndex);
-    candidates.sort((a, b) => blockCounts[a] - blockCounts[b] || ((a + seed + block.startDay) % EMPLOYEES.length) - ((b + seed + block.startDay) % EMPLOYEES.length));
+    candidates.sort(
+      (a, b) =>
+        blockCounts[a] - blockCounts[b] ||
+        seededNoise(seed, index, block.startDay, a) - seededNoise(seed, index, block.startDay, b),
+    );
 
     for (const employeeIndex of candidates) {
       const reason = canAssignNightBlock(schedule, parsed, block, employeeIndex, blockCounts, blockMax);
@@ -493,7 +561,7 @@ function assignNightBlocks(
       const recoveryDay = block.endDay + 1;
       if (recoveryDay <= schedule.length) lockedRecoveryOff.add(offKey(employeeIndex, recoveryDay));
 
-      if (dfs(orderIndex + 1)) return true;
+      if (hasBasicDEFeasibility(schedule, parsed, days, lockedRecoveryOff) && dfs(orderIndex + 1)) return true;
 
       if (recoveryDay <= schedule.length) lockedRecoveryOff.delete(offKey(employeeIndex, recoveryDay));
       blockCounts[employeeIndex] -= 1;
@@ -831,6 +899,7 @@ function scoreCandidate(
   const exploration = seed === 0 ? 0 : ((employeeIndex * 17 + day * 13 + seed * 23 + slot.code.charCodeAt(0)) % 11) * 2.5;
   let score = attempt.workCounts[employeeIndex] * 8;
   if (slot.code === "N") score += counts.N * 45;
+  score += counts[slot.code] * 12;
   if (parsed[employeeIndex].requests.get(day) === slot.code) score -= 90;
   if (slot.code === "D") score -= 5;
   if (slot.code === "N") score += 8;
@@ -839,9 +908,34 @@ function scoreCandidate(
   if (parsed[employeeIndex].vacation.has(day - 1) && slot.code === "N") score -= 18;
   const projectedOff = days.length - (attempt.workCounts[employeeIndex] + 1);
   if (parsed[employeeIndex].vacation.size > 0 && projectedOff < parsed[employeeIndex].targetOff) score += 180;
+  score -= Math.max(0, projectedOff - parsed[employeeIndex].minOff) * 3;
   const prev = attempt.schedule[slot.dayIndex - 1]?.[employee];
   if (prev !== "/" && prev !== undefined) score += 8;
   return score + exploration;
+}
+
+function candidatesForSlot(attempt: Attempt, parsed: ParsedEmployeeInput[], slot: Slot, maxWork: number[]) {
+  return EMPLOYEES.map((_, index) => index).filter((index) => canAssign(attempt, parsed, slot, index, maxWork));
+}
+
+function selectNextSlotIndex(attempt: Attempt, searchSlots: Slot[], parsed: ParsedEmployeeInput[], maxWork: number[]) {
+  let bestIndex = attempt.slotIndex;
+  let bestCandidateCount = Number.POSITIVE_INFINITY;
+  for (let index = attempt.slotIndex; index < searchSlots.length; index += 1) {
+    const candidateCount = candidatesForSlot(attempt, parsed, searchSlots[index], maxWork).length;
+    if (
+      candidateCount < bestCandidateCount ||
+      (candidateCount === bestCandidateCount &&
+        (searchSlots[index].dayIndex < searchSlots[bestIndex].dayIndex ||
+          (searchSlots[index].dayIndex === searchSlots[bestIndex].dayIndex &&
+            SLOT_PRIORITY[searchSlots[index].code] < SLOT_PRIORITY[searchSlots[bestIndex].code])))
+    ) {
+      bestIndex = index;
+      bestCandidateCount = candidateCount;
+      if (candidateCount === 0) break;
+    }
+  }
+  return bestIndex;
 }
 
 function search(
@@ -859,9 +953,12 @@ function search(
     return validateHard(attempt.schedule, parsed, days).length === 0;
   }
 
+  const nextSlotIndex = selectNextSlotIndex(attempt, searchSlots, parsed, maxWork);
+  const slotAtCurrent = searchSlots[attempt.slotIndex];
+  searchSlots[attempt.slotIndex] = searchSlots[nextSlotIndex];
+  searchSlots[nextSlotIndex] = slotAtCurrent;
   const slot = searchSlots[attempt.slotIndex];
-  const candidates = EMPLOYEES.map((_, index) => index)
-    .filter((index) => canAssign(attempt, parsed, slot, index, maxWork))
+  const candidates = candidatesForSlot(attempt, parsed, slot, maxWork)
     .sort((a, b) => scoreCandidate(attempt, parsed, slot, a, days, seed) - scoreCandidate(attempt, parsed, slot, b, days, seed));
 
   for (const employeeIndex of candidates) {
@@ -878,6 +975,8 @@ function search(
     attempt.workCounts[employeeIndex] -= 1;
     attempt.schedule[slot.dayIndex][employee] = "/";
   }
+  searchSlots[nextSlotIndex] = searchSlots[attempt.slotIndex];
+  searchSlots[attempt.slotIndex] = slotAtCurrent;
   return false;
 }
 
@@ -1281,6 +1380,66 @@ function postProcessM(
   };
 }
 
+function nightPlanSignature(schedule: Schedule) {
+  return buildNightBlocks(schedule.length)
+    .map((block) => {
+      const owner = EMPLOYEES.find((employee) => block.days.every((day) => schedule[day - 1][employee] === "N"));
+      return `${block.startDay}-${block.endDay}:${owner ?? "?"}`;
+    })
+    .join("|");
+}
+
+function firstFailingDESlotSummary(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  lockedOff: Set<string>,
+  searchSlots: Slot[],
+) {
+  const counts = recomputeCounts(schedule);
+  const maxWork = parsed.map((input) => days.length - input.minOff);
+  const attempt: Attempt = {
+    schedule,
+    lockedOff,
+    ...counts,
+    slotIndex: 0,
+    deadline: Number.POSITIVE_INFINITY,
+  };
+
+  const summaries = searchSlots.map((slot) => {
+    const candidates = candidatesForSlot(attempt, parsed, slot, maxWork);
+    const rejectedReasons = new Map<string, string[]>();
+    EMPLOYEES.forEach((employee, employeeIndex) => {
+      if (candidates.includes(employeeIndex)) return;
+      const reason = canAssignReason(attempt, parsed, slot, employeeIndex, maxWork) ?? "unknown";
+      rejectedReasons.set(reason, [...(rejectedReasons.get(reason) ?? []), employee]);
+    });
+    return { slot, candidates, rejectedReasons };
+  });
+
+  const tightest = summaries.sort((a, b) => a.candidates.length - b.candidates.length || a.slot.dayIndex - b.slot.dayIndex)[0];
+  if (!tightest) return null;
+  const rejectionText = [...tightest.rejectedReasons.entries()]
+    .map(([reason, employees]) => `${reason}: ${employees.join(", ")}`)
+    .join(" / ");
+  return [
+    `First failing D/E slot: day ${tightest.slot.dayIndex + 1} shift ${tightest.slot.code}.`,
+    `${tightest.slot.code} candidates: ${tightest.candidates.length > 0 ? tightest.candidates.map((index) => EMPLOYEES[index]).join(", ") : "none"}.`,
+    `Candidates rejected: ${rejectionText || "none"}.`,
+  ];
+}
+
+function commonFailureSummary(label: string, failures: string[], limit = 6) {
+  if (failures.length === 0) return [];
+  const counts = new Map<string, number>();
+  failures.forEach((failure) => counts.set(failure, (counts.get(failure) ?? 0) + 1));
+  const common = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([failure, count]) => `${failure} (${count})`);
+  return [`${label}: ${common.join(" / ")}`];
+}
+
 function listDays(days: number[]) {
   return days.length > 0 ? days.join(", ") : "none";
 }
@@ -1438,6 +1597,11 @@ export function generateSchedule(
   let lastNightAssignmentFailures: string[] = [];
   let lastDemAssignmentFailures: string[] = [];
   let sawFixedNightBlocks = false;
+  let nightPlanAttempts = 0;
+  let deFailedPlanCount = 0;
+  const distinctNightPlans = new Set<string>();
+  const allNightFailures: string[] = [];
+  const allDEFailures: string[] = [];
   const diagnostics = () => buildTier1Diagnostics(days, parsed, slots, requestConflicts);
   if (hardOffCapacityFailures.length > 0) {
     return {
@@ -1469,24 +1633,31 @@ export function generateSchedule(
     const maxWork = parsed.map((input) => days.length - input.minOff);
 
     let bestResult: { schedule: Schedule; score: number; stats: EmployeeStats[]; mPostProcess: MPostProcessResult } | null = null;
-    const seedAttempts = 48;
+    const seedAttempts = 120;
     for (let seed = 0; seed < seedAttempts; seed += 1) {
-      const effectiveSeed = variant * 8 + seed;
-      const nightAssignment = assignNightBlocks(emptySchedule(days.length), parsed, nightBlocks, effectiveSeed);
+      const effectiveSeed = variant * seedAttempts + seed;
+      nightPlanAttempts += 1;
+      const nightAssignment = assignNightBlocks(emptySchedule(days.length), parsed, nightBlocks, days, effectiveSeed);
       if (!nightAssignment.ok) {
         lastNightAssignmentFailures = nightAssignment.failures;
+        allNightFailures.push(...nightAssignment.failures);
         continue;
       }
       sawFixedNightBlocks = true;
       const schedule = nightAssignment.schedule;
+      distinctNightPlans.add(nightPlanSignature(schedule));
       const requestFillFailures = fillRequests(schedule, parsed, slots, nightAssignment.lockedRecoveryOff);
       if (requestFillFailures.length > 0) {
         lastDemAssignmentFailures = requestFillFailures;
+        allDEFailures.push(...requestFillFailures);
+        deFailedPlanCount += 1;
         continue;
       }
       const duplicateFailure = validateHard(schedule, parsed, days).filter((failure) => failure.includes("work assigned on fixed OFF/vacation"));
       if (duplicateFailure.length > 0) {
         lastDemAssignmentFailures = duplicateFailure;
+        allDEFailures.push(...duplicateFailure);
+        deFailedPlanCount += 1;
         continue;
       }
 
@@ -1498,7 +1669,7 @@ export function generateSchedule(
         lockedOff,
         ...counts,
         slotIndex: 0,
-        deadline: performance.now() + 5000,
+        deadline: performance.now() + 3000,
       };
       const calls = { count: 0 };
 
@@ -1518,7 +1689,10 @@ export function generateSchedule(
         const balance = computeBalanceStats(stats);
         if (balance.dRange <= 1 && balance.eveningRange <= 1) break;
       } else {
-        lastDemAssignmentFailures = ["Search exhausted before a valid D/E assignment was found."];
+        const firstFailing = firstFailingDESlotSummary(schedule, parsed, days, lockedOff, searchSlots);
+        lastDemAssignmentFailures = ["Search exhausted before a valid D/E assignment was found.", ...(firstFailing ?? [])];
+        allDEFailures.push(...lastDemAssignmentFailures);
+        deFailedPlanCount += 1;
       }
     }
 
@@ -1541,8 +1715,20 @@ export function generateSchedule(
     ok: false,
     days,
     failures: [
-      sawFixedNightBlocks ? "D/E assignment failed after N blocks were fixed." : "Night block assignment failed.",
-      ...(sawFixedNightBlocks ? lastDemAssignmentFailures : lastNightAssignmentFailures),
+      sawFixedNightBlocks
+        ? `Tried ${nightPlanAttempts} N-block plans; D/E search failed for all of them.`
+        : "Night block assignment failed for all attempts.",
+      ...(sawFixedNightBlocks
+        ? [
+            `Distinct N-block plans tried: ${distinctNightPlans.size}. D/E failed plans: ${deFailedPlanCount}.`,
+            ...lastDemAssignmentFailures,
+            ...commonFailureSummary("Most common D/E failures", allDEFailures),
+          ]
+        : [
+            `N-block plans attempted: ${nightPlanAttempts}.`,
+            ...lastNightAssignmentFailures,
+            ...commonFailureSummary("Top night block assignment failure reasons", allNightFailures),
+          ]),
       ...diagnostics(),
     ],
   };
