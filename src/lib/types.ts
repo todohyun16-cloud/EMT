@@ -8,6 +8,7 @@ export type EmployeeInput = {
   wantedOff: string;
   vacation: string;
   requests: string;
+  previousMonthSchedule?: (string | null)[];
 };
 
 export type ParsedEmployeeInput = {

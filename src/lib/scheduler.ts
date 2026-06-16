@@ -37,7 +37,7 @@ function normalizeShift(code: unknown): NormalizedShift | null {
   if (code === null || code === undefined) return null;
   const normalized = String(code).normalize("NFKC").trim().toUpperCase().replace(/\s+/g, "");
   if (normalized === "") return null;
-  if (normalized === "E1") return "M";
+  if (normalized === "E1" || normalized === "E竊?" || normalized === "E竊") return "M";
   if (normalized === "D" || normalized === "E" || normalized === "M" || normalized === "N") return normalized;
   if (normalized === "/" || normalized === "OFF") return "OFF";
   return null;
@@ -391,16 +391,6 @@ function blockRequestOwner(block: NightBlock, parsed: ParsedEmployeeInput[]) {
   return owners;
 }
 
-function lastPreviousNightRunLength(parsed: ParsedEmployeeInput[], employeeIndex: number) {
-  let run = 0;
-  const previous = previousTailFor(parsed, employeeIndex);
-  for (let index = previous.length - 1; index >= 0; index -= 1) {
-    if (previous[index] !== "N") break;
-    run += 1;
-  }
-  return run;
-}
-
 function canAssignNightBlock(
   schedule: Schedule,
   parsed: ParsedEmployeeInput[],
@@ -424,12 +414,6 @@ function canAssignNightBlock(
   const shiftAt = (dayIndex: number) => getShiftAtWithPrev(schedule, parsed, dayIndex, employeeIndex);
   const previousLimit = -previousTailFor(parsed, employeeIndex).length;
   const startIndex = block.startDay - 1;
-  const prev = shiftAt(startIndex - 1);
-  const prevPrev = shiftAt(startIndex - 2);
-  if (prev === "N" && prevPrev === "N") return `${employee} day ${block.startDay}: previous-month NN would create NNN`;
-  if (block.startDay === 1 && lastPreviousNightRunLength(parsed, employeeIndex) + block.length > 2) {
-    return `${employee} day ${block.startDay}: previous-month N run would exceed allowed N block`;
-  }
   if (nightSpacingViolation(shiftAt, startIndex, "N", previousLimit)) {
     return `${employee} day ${block.startDay}: previous-month night spacing conflict`;
   }
@@ -930,7 +914,7 @@ function validateHard(schedule: Schedule, parsed: ParsedEmployeeInput[], days: D
         finalBlock.days.every((blockDay) => schedule[blockDay - 1][employee] === "N");
       if (current === "D" && isEveningLike(prev)) failures.push(`${employee} day ${day}: E/M -> D pattern is forbidden`);
       if (prev === "N" && !isOffLike(current) && current !== "N") failures.push(`${employee} day ${day}: after N, ${current} is forbidden`);
-      if (current === "N" && prev === "N" && prevPrev === "N" && !isAllowedFinalNnn) failures.push(`${employee} day ${day}: NNN pattern is forbidden`);
+      if (dayIndex >= 2 && current === "N" && prev === "N" && prevPrev === "N" && !isAllowedFinalNnn) failures.push(`${employee} day ${day}: NNN pattern is forbidden`);
       else if (prev === "N" && prevPrev === "N" && !isOffLike(current) && current !== "N") failures.push(`${employee} day ${day}: after NN, ${current} is forbidden`);
       if (current === "D" && isOffLike(prev) && prevPrev === "N") failures.push(`${employee} day ${day}: N-O-D pattern is forbidden`);
       if (nightSpacingViolation(shiftAt, dayIndex, current, previousLimit)) failures.push(`${employee} day ${day}: night block spacing is less than 6 non-N days`);

@@ -1,7 +1,9 @@
 import { CalendarDays, Download, Loader2, Play, RefreshCw, RotateCcw } from "lucide-react";
 import { useMemo, useState } from "react";
 import { exportScheduleXlsx } from "@/lib/excel";
+import { buildDays } from "@/lib/holidays";
 import { parseDays } from "@/lib/input";
+import { parsePreviousScheduleXlsx } from "@/lib/previousSchedule";
 import { generateSchedule } from "@/lib/scheduler";
 import { EMPLOYEES, type Employee, type EmployeeInput, type ScheduleResult } from "@/lib/types";
 import styles from "./styles/App.module.css";
@@ -47,9 +49,49 @@ export default function App() {
   const runGenerate = (variant: number) => {
     setIsGenerating(true);
     window.setTimeout(() => {
-      const next = generateSchedule(year, month, inputs, parseDays(manualHolidays, maxDay), variant);
-      setResult(next);
-      setIsGenerating(false);
+      void (async () => {
+        const holidays = parseDays(manualHolidays, maxDay);
+
+        try {
+          const previousMonthLength = new Date(year, month - 1, 0).getDate();
+          let previousSchedules: Partial<Record<Employee, (string | null)[]>> = {};
+          if (template) {
+            try {
+              previousSchedules = await parsePreviousScheduleXlsx(template, previousMonthLength);
+            } catch {
+              setResult({
+                ok: false,
+                days: buildDays(year, month, holidays),
+                failures: ["Failed to read previous-month Excel schedule. Please check employee names and date headers."],
+              });
+              return;
+            }
+          }
+
+          const inputsWithPrevious = Object.fromEntries(
+            EMPLOYEES.map((employee) => [
+              employee,
+              {
+                ...inputs[employee],
+                previousMonthSchedule: previousSchedules[employee] ?? [],
+              },
+            ]),
+          ) as Record<Employee, EmployeeInput>;
+
+          const next = generateSchedule(year, month, inputsWithPrevious, holidays, variant);
+          if (next.ok && template) {
+            const loadedCount = EMPLOYEES.filter((employee) => previousSchedules[employee]?.length).length;
+            setResult({
+              ...next,
+              warnings: [...next.warnings, `Previous-month schedule loaded for ${loadedCount} employees.`],
+            });
+          } else {
+            setResult(next);
+          }
+        } finally {
+          setIsGenerating(false);
+        }
+      })();
     }, 20);
   };
 
