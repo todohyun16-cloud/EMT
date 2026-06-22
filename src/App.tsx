@@ -5,7 +5,7 @@ import { buildDays } from "@/lib/holidays";
 import { parseDays } from "@/lib/input";
 import { parsePreviousScheduleXlsx } from "@/lib/previousSchedule";
 import { generateSchedule } from "@/lib/scheduler";
-import { EMPLOYEES, type Employee, type EmployeeInput, type ScheduleResult } from "@/lib/types";
+import { DEFAULT_EMPLOYEES, type Employee, type EmployeeInput, type ScheduleResult } from "@/lib/types";
 import styles from "./styles/App.module.css";
 
 const now = new Date();
@@ -13,7 +13,7 @@ const emptyEmployeeInput: EmployeeInput = { wantedOff: "", vacation: "", request
 const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"];
 
 function defaultInputs() {
-  return Object.fromEntries(EMPLOYEES.map((employee) => [employee, { ...emptyEmployeeInput }])) as Record<Employee, EmployeeInput>;
+  return DEFAULT_EMPLOYEES.map(() => ({ ...emptyEmployeeInput }));
 }
 
 function shiftClass(code: string) {
@@ -26,7 +26,8 @@ function shiftClass(code: string) {
 export default function App() {
   const [year, setYear] = useState(now.getFullYear());
   const [month, setMonth] = useState(now.getMonth() + 1);
-  const [inputs, setInputs] = useState<Record<Employee, EmployeeInput>>(defaultInputs);
+  const [employeeNames, setEmployeeNames] = useState<string[]>([...DEFAULT_EMPLOYEES]);
+  const [inputs, setInputs] = useState<EmployeeInput[]>(defaultInputs);
   const [manualHolidays, setManualHolidays] = useState("");
   const [template, setTemplate] = useState<File | null>(null);
   const [result, setResult] = useState<ScheduleResult | null>(null);
@@ -36,14 +37,8 @@ export default function App() {
 
   const maxDay = useMemo(() => new Date(year, month, 0).getDate(), [year, month]);
 
-  const updateEmployee = (employee: Employee, field: keyof EmployeeInput, value: string) => {
-    setInputs((current) => ({
-      ...current,
-      [employee]: {
-        ...current[employee],
-        [field]: value,
-      },
-    }));
+  const updateEmployee = (employeeIndex: number, field: keyof EmployeeInput, value: string) => {
+    setInputs((current) => current.map((input, index) => (index === employeeIndex ? { ...input, [field]: value } : input)));
   };
 
   const runGenerate = (variant: number) => {
@@ -51,13 +46,23 @@ export default function App() {
     window.setTimeout(() => {
       void (async () => {
         const holidays = parseDays(manualHolidays, maxDay);
+        const activeEmployees = employeeNames.map((name) => name.trim());
+        if (activeEmployees.some((name) => name.length === 0) || new Set(activeEmployees).size !== activeEmployees.length) {
+          setResult({
+            ok: false,
+            days: buildDays(year, month, holidays),
+            failures: ["Employee names must be non-empty and unique."],
+          });
+          setIsGenerating(false);
+          return;
+        }
 
         try {
           const previousMonthLength = new Date(year, month - 1, 0).getDate();
           let previousSchedules: Partial<Record<Employee, (string | null)[]>> = {};
           if (template) {
             try {
-              previousSchedules = await parsePreviousScheduleXlsx(template, previousMonthLength);
+              previousSchedules = await parsePreviousScheduleXlsx(template, previousMonthLength, activeEmployees);
             } catch {
               setResult({
                 ok: false,
@@ -69,21 +74,26 @@ export default function App() {
           }
 
           const inputsWithPrevious = Object.fromEntries(
-            EMPLOYEES.map((employee) => [
+            activeEmployees.map((employee, index) => [
               employee,
               {
-                ...inputs[employee],
+                ...inputs[index],
                 previousMonthSchedule: previousSchedules[employee] ?? [],
               },
             ]),
           ) as Record<Employee, EmployeeInput>;
 
-          const next = generateSchedule(year, month, inputsWithPrevious, holidays, variant);
+          const next = generateSchedule(year, month, inputsWithPrevious, holidays, variant, activeEmployees);
           if (next.ok && template) {
-            const loadedCount = EMPLOYEES.filter((employee) => previousSchedules[employee]?.length).length;
+            const loadedCount = activeEmployees.filter((employee) => previousSchedules[employee]?.length).length;
+            const unmatched = activeEmployees.filter((employee) => !previousSchedules[employee]?.length);
             setResult({
               ...next,
-              warnings: [...next.warnings, `Previous-month schedule loaded for ${loadedCount} employees.`],
+              warnings: [
+                ...next.warnings,
+                `Previous-month schedule loaded for ${loadedCount} of ${activeEmployees.length} employees.`,
+                ...(unmatched.length > 0 ? [`No previous-month match for: ${unmatched.join(", ")}.`] : []),
+              ],
             });
           } else {
             setResult(next);
@@ -107,6 +117,7 @@ export default function App() {
   };
 
   const reset = () => {
+    setEmployeeNames([...DEFAULT_EMPLOYEES]);
     setInputs(defaultInputs());
     setManualHolidays("");
     setGenerationVariant(0);
@@ -123,6 +134,7 @@ export default function App() {
         days: result.days,
         schedule: result.schedule,
         stats: result.stats,
+        employees: result.stats.map((stat) => stat.employee),
         template,
       });
     } finally {
@@ -160,26 +172,34 @@ export default function App() {
             <input value={manualHolidays} onChange={(event) => setManualHolidays(event.target.value)} placeholder="예: 3,4,10" />
           </label>
           <label>
-            5월.xlsx 템플릿
+            이전 달 Excel 일정
             <input type="file" accept=".xlsx" onChange={(event) => setTemplate(event.target.files?.[0] ?? null)} />
           </label>
         </div>
 
         <div className={styles.employeeGrid}>
-          {EMPLOYEES.map((employee) => (
-            <article className={styles.employeePanel} key={employee}>
-              <h3>{employee}</h3>
+          {employeeNames.map((employee, employeeIndex) => (
+            <article className={styles.employeePanel} key={employeeIndex}>
+              <label>
+                직원 이름
+                <input
+                  value={employee}
+                  onChange={(event) =>
+                    setEmployeeNames((current) => current.map((name, index) => (index === employeeIndex ? event.target.value : name)))
+                  }
+                />
+              </label>
               <label>
                 원티드오프
-                <input value={inputs[employee].wantedOff} onChange={(event) => updateEmployee(employee, "wantedOff", event.target.value)} placeholder="3,4,10,11" />
+                <input value={inputs[employeeIndex].wantedOff} onChange={(event) => updateEmployee(employeeIndex, "wantedOff", event.target.value)} placeholder="3,4,10,11" />
               </label>
               <label>
                 휴가
-                <input value={inputs[employee].vacation} onChange={(event) => updateEmployee(employee, "vacation", event.target.value)} placeholder="12,13,14,15,16,17" />
+                <input value={inputs[employeeIndex].vacation} onChange={(event) => updateEmployee(employeeIndex, "vacation", event.target.value)} placeholder="12,13,14,15,16,17" />
               </label>
               <label>
                 희망근무
-                <input value={inputs[employee].requests} onChange={(event) => updateEmployee(employee, "requests", event.target.value)} placeholder="7:D, 18:N, 25:E" />
+                <input value={inputs[employeeIndex].requests} onChange={(event) => updateEmployee(employeeIndex, "requests", event.target.value)} placeholder="7:D, 18:N, 25:E" />
               </label>
             </article>
           ))}
@@ -238,7 +258,7 @@ export default function App() {
                   <th>일</th>
                   <th>요일</th>
                   <th>구분</th>
-                  {EMPLOYEES.map((employee) => (
+                  {result.stats.map(({ employee }) => (
                     <th key={employee}>{employee}</th>
                   ))}
                 </tr>
@@ -249,7 +269,7 @@ export default function App() {
                     <td>{day.day}</td>
                     <td>{WEEKDAYS[day.weekday]}</td>
                     <td>{day.holidayName ?? (day.isWeekend ? "주말" : "평일")}</td>
-                    {EMPLOYEES.map((employee) => {
+                    {result.stats.map(({ employee }) => {
                       const code = result.schedule[index][employee];
                       return (
                         <td key={employee}>

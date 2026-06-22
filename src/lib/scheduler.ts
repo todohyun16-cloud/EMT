@@ -2,6 +2,7 @@
 import { parseEmployeeInput } from "./input";
 import {
   EMPLOYEES,
+  setActiveEmployees,
   type DayInfo,
   type Employee,
   type EmployeeInput,
@@ -1147,7 +1148,11 @@ function validateHard(
       }
     }
     const offCount = schedule.filter((row) => row[employee] === "/").length;
-    if (offCount < parsed[employeeIndex].minOff) failures.push(`${employee}: OFF count ${offCount} is below minimum ${parsed[employeeIndex].minOff}`);
+    const offTarget = parsed[employeeIndex].minOff;
+    const maxOff = offTarget + (parsed[employeeIndex].vacation.size > 0 ? 1 : 0);
+    if (offCount < offTarget || offCount > maxOff) {
+      failures.push(`${employee}: OFF count ${offCount} is outside allowed target ${offTarget}${maxOff === offTarget ? "" : `-${maxOff}`}`);
+    }
   });
 
   derivedNightBlocks.forEach((block) => {
@@ -1159,19 +1164,6 @@ function validateHard(
     }
   });
 
-  const regularOffCounts = EMPLOYEES.map((employee, index) => ({
-    employee,
-    off: schedule.filter((row) => row[employee] === "/").length,
-    isLeaveAdjusted: parsed[index].vacation.size > 0 || parsed[index].minOff > 8,
-  })).filter((item) => !item.isLeaveAdjusted);
-  if (regularOffCounts.length >= 2) {
-    const minOff = Math.min(...regularOffCounts.map((item) => item.off));
-    const maxOff = Math.max(...regularOffCounts.map((item) => item.off));
-    if (maxOff - minOff > 1) {
-      failures.push(`Non-leave employee OFF count range ${maxOff - minOff} exceeds 1`);
-    }
-  }
-
   days.forEach((dayInfo, dayIndex) => {
     const row = schedule[dayIndex];
     const counts = SHIFTS.reduce((acc, code) => ({ ...acc, [code]: EMPLOYEES.filter((employee) => row[employee] === code).length }), {} as Record<WorkShift, number>);
@@ -1179,6 +1171,14 @@ function validateHard(
     if (counts.E !== 1) failures.push(`${dayInfo.day} day E count ${counts.E}`);
     if (counts.N !== 1) failures.push(`${dayInfo.day} day N count ${counts.N}`);
   });
+  const nCounts = EMPLOYEES.map((employee) => schedule.filter((row) => row[employee] === "N").length);
+  const minN = Math.floor(days.length / EMPLOYEES.length);
+  const maxN = Math.ceil(days.length / EMPLOYEES.length);
+  const expectedMaxCount = days.length % EMPLOYEES.length;
+  const actualMaxCount = nCounts.filter((count) => count === maxN).length;
+  if (nCounts.some((count) => count < minN || count > maxN) || (maxN > minN && actualMaxCount !== expectedMaxCount)) {
+    failures.push(`Exact N target failed: ${EMPLOYEES.map((employee, index) => `${employee} ${nCounts[index]}`).join(", ")}`);
+  }
   return [...new Set(failures)];
 }
 
@@ -1906,6 +1906,8 @@ type PreviousMonthFairness = {
   previousOffAverage: number;
   previousWorkAverage: number;
   previousOffDelta: number[];
+  currentOffTargets: number[];
+  currentMonthLength: number;
 };
 type BeamState = {
   schedule: Schedule;
@@ -1936,6 +1938,7 @@ type IntegratedSolveResult =
 function buildPreviousMonthFairness(
   parsed: ParsedEmployeeInput[],
   previousMonthLength: number,
+  currentMonthLength: number,
 ): PreviousMonthFairness {
   const previousOffCounts = parsed.map((_, employeeIndex) => {
     const previous = previousTailFor(parsed, employeeIndex);
@@ -1970,6 +1973,8 @@ function buildPreviousMonthFairness(
     previousOffAverage,
     previousWorkAverage,
     previousOffDelta: previousOffCounts.map((count, index) => (applied && eligible[index] && count !== null ? previousOffAverage - count : 0)),
+    currentOffTargets: parsed.map((input) => input.minOff),
+    currentMonthLength,
   };
 }
 
@@ -2009,7 +2014,6 @@ function initialBeamState(parsed: ParsedEmployeeInput[]): BeamState {
 
 function enumerateDailyPatterns(dayIndex: number, parsed: ParsedEmployeeInput[], days: DayInfo[]) {
   const day = dayIndex + 1;
-  const desiredM = days[dayIndex].isRestDay;
   const patterns: Record<Employee, ShiftCode>[] = [];
   const staticFailures: string[] = [];
   const requestedM = EMPLOYEES.map((_, index) => index).filter((index) => normalizeShift(parsed[index].requests.get(day)) === "M");
@@ -2023,7 +2027,7 @@ function enumerateDailyPatterns(dayIndex: number, parsed: ParsedEmployeeInput[],
       for (let e = 0; e < EMPLOYEES.length; e += 1) {
         if (e === n || e === d) continue;
         const remaining = EMPLOYEES.map((_, index) => index).filter((index) => index !== n && index !== d && index !== e);
-        const mOptions: (number | null)[] = requestedM.length === 1 ? [requestedM[0]] : desiredM ? [null, ...remaining] : [null];
+        const mOptions: (number | null)[] = requestedM.length === 1 ? [requestedM[0]] : [null, ...remaining];
         for (const m of mOptions) {
           if (m !== null && !remaining.includes(m)) continue;
           const row = Object.fromEntries(EMPLOYEES.map((employee) => [employee, "/" as ShiftCode])) as Record<Employee, ShiftCode>;
@@ -2080,6 +2084,11 @@ function beamStateScore(state: BeamState, fairness: PreviousMonthFairness) {
     const average = values.reduce((sum, value) => sum + value, 0) / values.length;
     return values.reduce((sum, value) => sum + (value - average) ** 2, 0);
   };
+  const progress = state.schedule.length / fairness.currentMonthLength;
+  const offTargetPenalty = state.offCounts.reduce(
+    (sum, count, index) => sum + (count - fairness.currentOffTargets[index] * progress) ** 2,
+    0,
+  );
   return (
     state.spacingRelaxations * 120000 +
     state.nODRelaxations * 240000 +
@@ -2091,6 +2100,7 @@ function beamStateScore(state: BeamState, fairness: PreviousMonthFairness) {
     variancePenalty(state.workCounts) * 12 +
     variancePenalty(state.offCounts) * 8 -
     state.desiredMAssigned * 100000 +
+    offTargetPenalty * 24 +
     previousFairnessScore(state, fairness)
   );
 }
@@ -2176,6 +2186,10 @@ function expandBeamState(
         next.nStreak[employeeIndex] = 1;
       }
       next.nDayCounts[employeeIndex] += 1;
+      const maxNightCount = Math.ceil(days.length / EMPLOYEES.length);
+      if (next.nDayCounts[employeeIndex] > maxNightCount) {
+        return { ok: false as const, reason: `${employee} day ${dayIndex + 1}: exact N target exceeded` };
+      }
     } else if (wasInNightBlock) {
       closeNightBlock(next, employeeIndex, dayIndex - 1);
     }
@@ -2191,6 +2205,18 @@ function expandBeamState(
     next.workCounts[employeeIndex] = nextWorkCount;
     if (isOff) next.offCounts[employeeIndex] += 1;
     else next.shiftCounts[employeeIndex][shift] += 1;
+    const remainingDays = days.length - dayIndex - 1;
+    const minNightCount = Math.floor(days.length / EMPLOYEES.length);
+    if (next.nDayCounts[employeeIndex] + remainingDays < minNightCount) {
+      return { ok: false as const, reason: `${employee} day ${dayIndex + 1}: exact N target cannot be reached` };
+    }
+    const maxOff = parsed[employeeIndex].minOff + (parsed[employeeIndex].vacation.size > 0 ? 1 : 0);
+    if (next.offCounts[employeeIndex] > maxOff) {
+      return { ok: false as const, reason: `${employee} day ${dayIndex + 1}: OFF target exceeded` };
+    }
+    if (next.offCounts[employeeIndex] + remainingDays < parsed[employeeIndex].minOff) {
+      return { ok: false as const, reason: `${employee} day ${dayIndex + 1}: OFF target cannot be reached` };
+    }
     next.pendingRecovery[employeeIndex] = false;
     next.nODForbidden[employeeIndex] = (state.pendingRecovery[employeeIndex] || (wasInNightBlock && shift !== "N")) && isOff;
     next.lastShift[employeeIndex] = normalized;
@@ -2327,6 +2353,35 @@ function addIntegratedWeekdayCompensation(
   return { schedule: result, assigned };
 }
 
+function reduceVacationOffFallback(
+  schedule: Schedule,
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  tier: IntegratedTier,
+) {
+  const result = schedule.map((row) => ({ ...row })) as Schedule;
+  EMPLOYEES.forEach((employee, employeeIndex) => {
+    if (parsed[employeeIndex].vacation.size === 0) return;
+    const offCount = result.filter((row) => row[employee] === "/").length;
+    if (offCount !== parsed[employeeIndex].minOff + 1) return;
+    const candidates: { dayIndex: number; score: number }[] = [];
+    days.forEach((dayInfo, dayIndex) => {
+      if (result[dayIndex][employee] !== "/" || parsed[employeeIndex].fixedOff.has(dayInfo.day) || currentMCount(result, dayIndex) > 0) return;
+      const candidate = result.map((row) => ({ ...row })) as Schedule;
+      candidate[dayIndex][employee] = "M";
+      if (validateHard(candidate, parsed, days, integratedRelaxations(tier)).length > 0) return;
+      candidates.push({ dayIndex, score: dayInfo.isRestDay ? 0 : 1 });
+    });
+    candidates.sort((a, b) => a.score - b.score || a.dayIndex - b.dayIndex);
+    if (candidates[0]) result[candidates[0].dayIndex][employee] = "M";
+  });
+  const fallbackEmployees = EMPLOYEES.filter((employee, employeeIndex) => {
+    if (parsed[employeeIndex].vacation.size === 0) return false;
+    return result.filter((row) => row[employee] === "/").length === parsed[employeeIndex].minOff + 1;
+  });
+  return { schedule: result, fallbackEmployees };
+}
+
 function buildTier1Diagnostics(
   days: DayInfo[],
   parsed: ParsedEmployeeInput[],
@@ -2355,16 +2410,31 @@ export function generateSchedule(
   inputs: Record<Employee, EmployeeInput>,
   manualHolidayDays: Set<number>,
   variant = 0,
+  activeEmployees: readonly Employee[] = Object.keys(inputs),
 ): ScheduleResult {
+  const normalizedEmployees = activeEmployees.map((employee) => employee.trim());
+  setActiveEmployees(normalizedEmployees);
   const days = buildDays(year, month, manualHolidayDays);
+  if (
+    normalizedEmployees.length === 0 ||
+    normalizedEmployees.some((employee) => employee.length === 0) ||
+    new Set(normalizedEmployees).size !== normalizedEmployees.length ||
+    normalizedEmployees.some((employee) => !inputs[employee])
+  ) {
+    return { ok: false, days, failures: ["Employee names must be non-empty and unique."] };
+  }
   const previousMonthLength = new Date(year, month - 1, 0).getDate();
+  const baseOff = days.filter((day) => day.isRestDay).length;
   const parsed = EMPLOYEES.map((employee) => {
     const input = inputs[employee];
     const parsedInput = parseEmployeeInput(input, days.length) as ParsedWithPrevious;
+    const offTarget = baseOff + (parsedInput.vacation.size > 0 ? 2 : 0);
+    parsedInput.minOff = offTarget;
+    parsedInput.targetOff = offTarget;
     parsedInput.previousMonthSchedule = normalizePreviousMonthSchedule(input, previousMonthLength);
     return parsedInput;
   });
-  const previousFairness = buildPreviousMonthFairness(parsed, previousMonthLength);
+  const previousFairness = buildPreviousMonthFairness(parsed, previousMonthLength, days.length);
   const requestFailures = integratedRequestFailures(parsed, days);
   const capacityFailures = dailyHardOffCapacityFailures(days, parsed);
   if (requestFailures.length > 0 || capacityFailures.length > 0) {
@@ -2388,9 +2458,10 @@ export function generateSchedule(
     }
 
     const desiredMDays = days.filter((day) => day.isRestDay).map((day) => day.day);
-    const assignedWeekendM = desiredMDays.filter((day) => currentMCount(solved.schedule, day - 1) > 0);
-    const removedM = desiredMDays.filter((day) => currentMCount(solved.schedule, day - 1) === 0);
-    const compensated = addIntegratedWeekdayCompensation(solved.schedule, parsed, days, tier, removedM.length);
+    const normalizedVacationOff = reduceVacationOffFallback(solved.schedule, parsed, days, tier);
+    const assignedWeekendM = desiredMDays.filter((day) => currentMCount(normalizedVacationOff.schedule, day - 1) > 0);
+    const removedM = desiredMDays.filter((day) => currentMCount(normalizedVacationOff.schedule, day - 1) === 0);
+    const compensated = addIntegratedWeekdayCompensation(normalizedVacationOff.schedule, parsed, days, tier, removedM.length);
     const uncompensated = Math.max(0, removedM.length - compensated.assigned);
     const finalFailures = validateHard(compensated.schedule, parsed, days, integratedRelaxations(tier));
     if (finalFailures.length > 0) {
@@ -2400,12 +2471,20 @@ export function generateSchedule(
 
     const stats = computeStats(compensated.schedule, days);
     const nightSummary = nightScheduleSummary(compensated.schedule);
+    const fallbackEmployees = EMPLOYEES.filter((employee, employeeIndex) => {
+      if (parsed[employeeIndex].vacation.size === 0) return false;
+      return stats[employeeIndex].off === parsed[employeeIndex].minOff + 1;
+    });
     const warnings = [
       ...solved.warnings,
       `N schedule: day counts ${EMPLOYEES.map((employee, index) => `${employee}:${nightSummary.dayCounts[index]}`).join(", ")}; block counts ${EMPLOYEES.map((employee, index) => `${employee}:${nightSummary.blockCounts[index]}`).join(", ")}; single N ${nightSummary.singles}; NN ${nightSummary.doubles}; NNN ${nightSummary.triples}; NNN exception ${nightSummary.triples > 0 ? `used (${nightSummary.tripleDetails.join(", ")})` : "not used"}.`,
       `M service: desired weekend/holiday ${desiredMDays.length}, assigned weekend/holiday ${assignedWeekendM.length}, removed weekend/holiday ${removedM.length}, weekday compensation ${compensated.assigned}, uncompensated ${uncompensated}.`,
+      `Base OFF: ${baseOff}.`,
+      `OFF targets: ${EMPLOYEES.map((employee, index) => `${employee} ${parsed[index].minOff}`).join(", ")}.`,
+      `Actual OFF counts: ${EMPLOYEES.map((employee, index) => `${employee} ${stats[index].off}`).join(", ")}.`,
     ];
     if (uncompensated > 0) warnings.push(`${uncompensated} removed weekend/holiday M shift(s) could not be compensated on weekdays.`);
+    if (fallbackEmployees.length > 0) warnings.push(`Vacation OFF +3 fallback used for: ${fallbackEmployees.join(", ")}.`);
     if (previousFairness.applied) {
       const currentOffAverage = previousFairness.eligible.reduce(
         (sum, isEligible, index) => sum + (isEligible ? stats[index].off : 0),

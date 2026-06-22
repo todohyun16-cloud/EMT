@@ -1,6 +1,10 @@
-export const EMPLOYEES = ["정채현", "조한승", "이우석", "신민아", "박대성"] as const;
+export const DEFAULT_EMPLOYEES = ["정채현", "조한승", "이우석", "신민아", "박대성"] as const;
+export type Employee = string;
+export let EMPLOYEES: Employee[] = [...DEFAULT_EMPLOYEES];
 
-export type Employee = (typeof EMPLOYEES)[number];
+export function setActiveEmployees(employees: readonly Employee[]) {
+  EMPLOYEES = employees.map((employee) => employee.trim());
+}
 export type ShiftCode = "D" | "E" | "M" | "N" | "/";
 export type WorkShift = Exclude<ShiftCode, "/">;
 

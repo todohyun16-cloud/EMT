@@ -1,4 +1,4 @@
-import { EMPLOYEES, type Employee } from "./types";
+import type { Employee } from "./types";
 
 type ExcelJSModule = typeof import("exceljs");
 
@@ -41,19 +41,20 @@ function cellDay(value: unknown, previousMonthLength: number): number | null {
 
 function normalizeShift(value: unknown): string | null {
   const text = cellValueText(value).normalize("NFKC").trim().toUpperCase().replace(/\s+/g, "");
-  if (text === "" || text === "/" || text === "OFF") return null;
+  if (text === "") return null;
+  if (text === "/" || text === "OFF") return "OFF";
   if (text === "E1" || text === "E竊?" || text === "E竊") return "M";
   if (text === "D" || text === "E" || text === "M" || text === "N") return text;
   return null;
 }
 
-function findEmployeeRows(worksheet: import("exceljs").Worksheet) {
+function findEmployeeRows(worksheet: import("exceljs").Worksheet, employees: readonly Employee[]) {
   const rows = new Map<Employee, number>();
 
   worksheet.eachRow((row, rowNumber) => {
     row.eachCell((cell) => {
       const text = cellValueText(cell.value).normalize("NFKC").trim();
-      if (EMPLOYEES.includes(text as Employee)) rows.set(text as Employee, rowNumber);
+      if (employees.includes(text)) rows.set(text, rowNumber);
     });
   });
 
@@ -80,6 +81,7 @@ function findDateColumns(worksheet: import("exceljs").Worksheet, previousMonthLe
 export async function parsePreviousScheduleXlsx(
   file: File,
   previousMonthLength: number,
+  employees: readonly Employee[],
 ): Promise<Partial<Record<Employee, (string | null)[]>>> {
   const ExcelJS = (await import("exceljs")) as ExcelJSModule;
   const workbook = new ExcelJS.Workbook();
@@ -89,18 +91,18 @@ export async function parsePreviousScheduleXlsx(
   const worksheet = workbook.worksheets[0];
   if (!worksheet) throw new Error("Previous schedule workbook has no worksheets.");
 
-  const employeeRows = findEmployeeRows(worksheet);
+  const activeEmployees = employees.map((employee) => employee.trim());
+  const employeeRows = findEmployeeRows(worksheet, activeEmployees);
   const dateColumns = findDateColumns(worksheet, previousMonthLength);
-  const missingEmployees = EMPLOYEES.filter((employee) => !employeeRows.has(employee));
-  if (missingEmployees.length > 0) throw new Error(`Previous schedule workbook is missing employees: ${missingEmployees.join(", ")}`);
 
   const missingDays = Array.from({ length: previousMonthLength }, (_, index) => index + 1).filter((day) => !dateColumns.has(day));
   if (missingDays.length > 0) throw new Error(`Previous schedule workbook is missing day columns: ${missingDays.join(", ")}`);
 
   const schedules: Partial<Record<Employee, (string | null)[]>> = {};
 
-  EMPLOYEES.forEach((employee) => {
-    const row = employeeRows.get(employee)!;
+  activeEmployees.forEach((employee) => {
+    const row = employeeRows.get(employee);
+    if (!row) return;
 
     schedules[employee] = Array.from({ length: previousMonthLength }, (_, index) => {
       const column = dateColumns.get(index + 1)!;
