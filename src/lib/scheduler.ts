@@ -71,6 +71,19 @@ function isEveningLike(code: unknown) {
   return normalized === "E" || normalized === "M";
 }
 
+function conflictsWithKnownNextDayRequest(
+  assignedToday: ShiftCode,
+  nextRequested: NormalizedShift | null,
+): string | null {
+  if ((assignedToday === "E" || assignedToday === "M") && nextRequested === "D") {
+    return "E/M today conflicts with requested D tomorrow";
+  }
+  if (assignedToday === "N" && (nextRequested === "D" || nextRequested === "E" || nextRequested === "M")) {
+    return "N today conflicts with requested non-N work tomorrow because recovery OFF or N is required";
+  }
+  return null;
+}
+
 function isOffLike(code: NormalizedShift | null) {
   return code === "OFF" || code === null;
 }
@@ -1110,6 +1123,7 @@ function validateHard(
   parsed: ParsedEmployeeInput[],
   days: DayInfo[],
   relaxations: { nightSpacing?: boolean; nOD?: boolean } = {},
+  quota?: MonthlyQuotaPlan,
 ) {
   const failures: string[] = [];
   const derivedNightBlocks = deriveNightBlocks(schedule);
@@ -1148,10 +1162,15 @@ function validateHard(
       }
     }
     const offCount = schedule.filter((row) => row[employee] === "/").length;
-    const offTarget = parsed[employeeIndex].minOff;
-    const maxOff = offTarget + (parsed[employeeIndex].vacation.size > 0 ? 1 : 0);
-    if (offCount < offTarget || offCount > maxOff) {
-      failures.push(`${employee}: OFF count ${offCount} is outside allowed target ${offTarget}${maxOff === offTarget ? "" : `-${maxOff}`}`);
+    const offTarget = quota?.offTargets[employeeIndex] ?? parsed[employeeIndex].minOff;
+    if (offCount !== offTarget) {
+      failures.push(`${employee}: OFF count ${offCount} does not equal target ${offTarget}`);
+    }
+    if (quota) {
+      const workCount = schedule.filter((row) => row[employee] !== "/").length;
+      if (workCount !== quota.workTargets[employeeIndex]) {
+        failures.push(`${employee}: work count ${workCount} does not equal target ${quota.workTargets[employeeIndex]}`);
+      }
     }
   });
 
@@ -1170,14 +1189,26 @@ function validateHard(
     if (counts.D !== 1) failures.push(`${dayInfo.day} day D count ${counts.D}`);
     if (counts.E !== 1) failures.push(`${dayInfo.day} day E count ${counts.E}`);
     if (counts.N !== 1) failures.push(`${dayInfo.day} day N count ${counts.N}`);
+    if (counts.M > 1) failures.push(`${dayInfo.day} day M count ${counts.M}`);
+    if (counts.M > 0 && parsed.some((input) => input.vacation.has(dayInfo.day))) {
+      failures.push(`${dayInfo.day} day M is forbidden because at least one employee is on vacation`);
+    }
   });
   const nCounts = EMPLOYEES.map((employee) => schedule.filter((row) => row[employee] === "N").length);
   const minN = Math.floor(days.length / EMPLOYEES.length);
   const maxN = Math.ceil(days.length / EMPLOYEES.length);
   const expectedMaxCount = days.length % EMPLOYEES.length;
   const actualMaxCount = nCounts.filter((count) => count === maxN).length;
-  if (nCounts.some((count) => count < minN || count > maxN) || (maxN > minN && actualMaxCount !== expectedMaxCount)) {
+  if (quota && nCounts.some((count, index) => count !== quota.nTargets[index])) {
+    failures.push(
+      `Exact N target vector failed: ${EMPLOYEES.map((employee, index) => `${employee} ${nCounts[index]}/${quota.nTargets[index]}`).join(", ")}`,
+    );
+  } else if (!quota && (nCounts.some((count) => count < minN || count > maxN) || (maxN > minN && actualMaxCount !== expectedMaxCount))) {
     failures.push(`Exact N target failed: ${EMPLOYEES.map((employee, index) => `${employee} ${nCounts[index]}`).join(", ")}`);
+  }
+  if (quota) {
+    const totalM = schedule.reduce((sum, row) => sum + (EMPLOYEES.some((employee) => row[employee] === "M") ? 1 : 0), 0);
+    if (totalM !== quota.requiredM) failures.push(`Required M ${quota.requiredM}; assigned M ${totalM}.`);
   }
   return [...new Set(failures)];
 }
@@ -1909,8 +1940,25 @@ type PreviousMonthFairness = {
   currentOffTargets: number[];
   currentMonthLength: number;
 };
+type MonthlyQuotaPlan = {
+  name: string;
+  offTargets: number[];
+  workTargets: number[];
+  requiredM: number;
+  nFloorTarget: number;
+  nCeilTarget: number;
+  nRemainder: number;
+  nTargets: number[];
+  fallbackEmployeeIndexes: number[];
+};
+type BeamHistory = {
+  row: Record<Employee, ShiftCode>;
+  previous: BeamHistory | null;
+};
 type BeamState = {
   schedule: Schedule;
+  history: BeamHistory | null;
+  dayCount: number;
   lastShift: (NormalizedShift | null)[];
   workStreak: number[];
   nStreak: number[];
@@ -1922,6 +1970,14 @@ type BeamState = {
   shiftCounts: Record<WorkShift, number>[];
   offCounts: number[];
   workCounts: number[];
+  remainingOffNeeded: number[];
+  remainingWorkNeeded: number[];
+  remainingNNeeded: number[];
+  knownFutureMandatoryOffCounts: number[];
+  remainingLegalNDays: number[];
+  totalMCount: number;
+  remainingMNeeded: number;
+  urgencyPenalty: number;
   singleN: number;
   doubleN: number;
   tripleN: number;
@@ -1932,8 +1988,30 @@ type BeamState = {
 };
 
 type IntegratedSolveResult =
-  | { ok: true; state: BeamState; schedule: Schedule; warnings: string[] }
-  | { ok: false; failures: string[] };
+  | { ok: true; state: BeamState; schedule: Schedule; warnings: string[]; performanceDiagnostics: string[] }
+  | { ok: false; failures: string[]; performanceDiagnostics: string[] };
+
+type BeamDayMetrics = {
+  day: number;
+  currentStates: number;
+  patternAttempts: number;
+  successfulDirectExpansions: number;
+  forwardCheckCalls: number;
+  forwardCheckCacheHits: number;
+  nextDayPatternProbes: number;
+  uniqueSignatures: number;
+  remainingMCapacityRejections: number;
+  elapsedMs: number;
+};
+
+type SolverPerformanceMetrics = {
+  elapsedMs: number;
+  forwardCheckCalls: number;
+  forwardCheckCacheHits: number;
+  nextDayPatternProbes: number;
+  remainingMCapacityRejections: number;
+  days: BeamDayMetrics[];
+};
 
 function buildPreviousMonthFairness(
   parsed: ParsedEmployeeInput[],
@@ -1953,7 +2031,6 @@ function buildPreviousMonthFairness(
   const eligible = parsed.map(
     (input, employeeIndex) =>
       input.vacation.size === 0 &&
-      input.minOff === 8 &&
       previousOffCounts[employeeIndex] !== null &&
       previousWorkCounts[employeeIndex] !== null,
   );
@@ -1982,7 +2059,7 @@ function integratedRelaxations(tier: IntegratedTier) {
   return { nightSpacing: tier >= 2, nOD: tier >= 3 };
 }
 
-function initialBeamState(parsed: ParsedEmployeeInput[]): BeamState {
+function initialBeamState(parsed: ParsedEmployeeInput[], quota: MonthlyQuotaPlan): BeamState {
   const lastShift = parsed.map((_, employeeIndex) => previousTailFor(parsed, employeeIndex).at(-1) ?? null);
   const pendingRecovery = lastShift.map((shift) => shift === "N");
   const nODForbidden = parsed.map((_, employeeIndex) => {
@@ -1991,6 +2068,8 @@ function initialBeamState(parsed: ParsedEmployeeInput[]): BeamState {
   });
   return {
     schedule: [],
+    history: null,
+    dayCount: 0,
     lastShift,
     workStreak: parsed.map((_, employeeIndex) => trailingPreviousWorkStreak(parsed, employeeIndex)),
     nStreak: EMPLOYEES.map(() => 0),
@@ -2002,6 +2081,14 @@ function initialBeamState(parsed: ParsedEmployeeInput[]): BeamState {
     shiftCounts: cloneCounts(),
     offCounts: EMPLOYEES.map(() => 0),
     workCounts: EMPLOYEES.map(() => 0),
+    remainingOffNeeded: [...quota.offTargets],
+    remainingWorkNeeded: [...quota.workTargets],
+    remainingNNeeded: [...quota.nTargets],
+    knownFutureMandatoryOffCounts: EMPLOYEES.map(() => 0),
+    remainingLegalNDays: EMPLOYEES.map(() => 0),
+    totalMCount: 0,
+    remainingMNeeded: quota.requiredM,
+    urgencyPenalty: 0,
     singleN: 0,
     doubleN: 0,
     tripleN: 0,
@@ -2016,6 +2103,7 @@ function enumerateDailyPatterns(dayIndex: number, parsed: ParsedEmployeeInput[],
   const day = dayIndex + 1;
   const patterns: Record<Employee, ShiftCode>[] = [];
   const staticFailures: string[] = [];
+  const hasVacation = parsed.some((input) => input.vacation.has(day));
   const requestedM = EMPLOYEES.map((_, index) => index).filter((index) => normalizeShift(parsed[index].requests.get(day)) === "M");
   if (requestedM.length > 1) {
     return { patterns, staticFailures: [`Day ${day}: multiple employees requested M: ${requestedM.map((index) => EMPLOYEES[index]).join(", ")}`] };
@@ -2027,7 +2115,7 @@ function enumerateDailyPatterns(dayIndex: number, parsed: ParsedEmployeeInput[],
       for (let e = 0; e < EMPLOYEES.length; e += 1) {
         if (e === n || e === d) continue;
         const remaining = EMPLOYEES.map((_, index) => index).filter((index) => index !== n && index !== d && index !== e);
-        const mOptions: (number | null)[] = requestedM.length === 1 ? [requestedM[0]] : [null, ...remaining];
+        const mOptions: (number | null)[] = hasVacation ? [null] : requestedM.length === 1 ? [requestedM[0]] : [null, ...remaining];
         for (const m of mOptions) {
           if (m !== null && !remaining.includes(m)) continue;
           const row = Object.fromEntries(EMPLOYEES.map((employee) => [employee, "/" as ShiftCode])) as Record<Employee, ShiftCode>;
@@ -2042,6 +2130,8 @@ function enumerateDailyPatterns(dayIndex: number, parsed: ParsedEmployeeInput[],
             if (parsed[employeeIndex].fixedOff.has(day) && assigned !== "/") valid = false;
             const requested = normalizeShift(parsed[employeeIndex].requests.get(day));
             if (requested && requested !== "OFF" && assigned !== requested) valid = false;
+            const requestedTomorrow = normalizeShift(parsed[employeeIndex].requests.get(day + 1));
+            if (conflictsWithKnownNextDayRequest(assigned, requestedTomorrow)) valid = false;
           });
           if (valid) patterns.push(row);
         }
@@ -2049,9 +2139,113 @@ function enumerateDailyPatterns(dayIndex: number, parsed: ParsedEmployeeInput[],
     }
   }
   if (patterns.length === 0 && staticFailures.length === 0) {
-    staticFailures.push(`Day ${day}: no static D/E/N/M pattern respects fixedOff/vacation/wantedOff and requested shifts.`);
+    staticFailures.push(`Day ${day}: no static D/E/N${hasVacation ? "" : "/M"} pattern respects fixedOff/vacation/wantedOff and requested shifts.`);
   }
   return { patterns, staticFailures };
+}
+
+function staticNightAvailability(dailyPatterns: ReturnType<typeof enumerateDailyPatterns>[]) {
+  return dailyPatterns.map(({ patterns }) =>
+    EMPLOYEES.map((employee) => patterns.some((row) => row[employee] === "N")),
+  );
+}
+
+function requestedNightRecoveryDates(
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  nightAvailability: boolean[][],
+) {
+  return parsed.map((input, employeeIndex) => {
+    const recoveryDates = new Set<number>();
+    let requestedRun = 0;
+    for (let day = 1; day <= days.length; day += 1) {
+      if (normalizeShift(input.requests.get(day)) !== "N") {
+        requestedRun = 0;
+        continue;
+      }
+      requestedRun += 1;
+      const recoveryDay = day + 1;
+      if (recoveryDay > days.length) continue;
+      const nextRequested = normalizeShift(input.requests.get(recoveryDay));
+      const nextNightIsLegal = nightAvailability[recoveryDay - 1][employeeIndex];
+      if (requestedRun >= 3 || (nextRequested !== "N" && !nextNightIsLegal)) recoveryDates.add(recoveryDay);
+    }
+    return recoveryDates;
+  });
+}
+
+function openNightBlockCanContinue(
+  state: BeamState,
+  employeeIndex: number,
+  nextDayIndex: number,
+  days: DayInfo[],
+  quota: MonthlyQuotaPlan,
+  nightAvailability: boolean[][],
+) {
+  if (state.nStreak[employeeIndex] === 0 || nextDayIndex >= days.length) return false;
+  if (state.nDayCounts[employeeIndex] >= quota.nTargets[employeeIndex]) return false;
+  if (!nightAvailability[nextDayIndex][employeeIndex]) return false;
+  if (state.nStreak[employeeIndex] >= 3) return false;
+  if (state.nStreak[employeeIndex] === 2 && (days.length % 2 === 0 || state.tripleN > 0)) return false;
+  return true;
+}
+
+type FutureQuotaAvailability = {
+  mandatoryDates: Set<number>[][];
+  legalNightCounts: number[][];
+};
+
+function buildFutureQuotaAvailability(
+  parsed: ParsedEmployeeInput[],
+  days: DayInfo[],
+  nightAvailability: boolean[][],
+  requestedRecoveryDates: Set<number>[],
+): FutureQuotaAvailability {
+  const mandatoryDates = days.map((_, processedDayIndex) =>
+    EMPLOYEES.map((__, employeeIndex) => {
+      const dates = new Set<number>();
+      for (let futureDayIndex = processedDayIndex + 1; futureDayIndex < days.length; futureDayIndex += 1) {
+        const day = futureDayIndex + 1;
+        if (parsed[employeeIndex].fixedOff.has(day) || requestedRecoveryDates[employeeIndex].has(day)) dates.add(day);
+      }
+      return dates;
+    }),
+  );
+  const legalNightCounts = days.map((_, processedDayIndex) =>
+    EMPLOYEES.map((__, employeeIndex) => {
+      let count = 0;
+      for (let futureDayIndex = processedDayIndex + 1; futureDayIndex < days.length; futureDayIndex += 1) {
+        if (nightAvailability[futureDayIndex][employeeIndex] && !mandatoryDates[processedDayIndex][employeeIndex].has(futureDayIndex + 1)) count += 1;
+      }
+      return count;
+    }),
+  );
+  return { mandatoryDates, legalNightCounts };
+}
+
+function knownFutureMandatoryOffInfo(
+  state: BeamState,
+  employeeIndex: number,
+  processedDayIndex: number,
+  days: DayInfo[],
+  quota: MonthlyQuotaPlan,
+  nightAvailability: boolean[][],
+  futureAvailability: FutureQuotaAvailability,
+) {
+  const dates = futureAvailability.mandatoryDates[processedDayIndex][employeeIndex];
+  const nextDayIndex = processedDayIndex + 1;
+  const forcedRecoveryDay =
+    state.nStreak[employeeIndex] > 0 &&
+    nextDayIndex < days.length &&
+    !openNightBlockCanContinue(state, employeeIndex, nextDayIndex, days, quota, nightAvailability)
+      ? nextDayIndex + 1
+      : null;
+  const hasAdditionalForcedRecovery = forcedRecoveryDay !== null && !dates.has(forcedRecoveryDay);
+  const mandatoryCount = dates.size + (hasAdditionalForcedRecovery ? 1 : 0);
+  const legalNightCount =
+    futureAvailability.legalNightCounts[processedDayIndex][employeeIndex] -
+    (hasAdditionalForcedRecovery && nightAvailability[nextDayIndex][employeeIndex] ? 1 : 0);
+  return { dates, forcedRecoveryDay: hasAdditionalForcedRecovery ? forcedRecoveryDay : null, mandatoryCount, legalNightCount };
 }
 
 function closeNightBlock(state: BeamState, employeeIndex: number, endIndex: number) {
@@ -2079,16 +2273,55 @@ function previousFairnessScore(state: BeamState, fairness: PreviousMonthFairness
   }, 0);
 }
 
-function beamStateScore(state: BeamState, fairness: PreviousMonthFairness) {
+function mPlacementPreferencePenalty(
+  dayIndex: number,
+  row: Record<Employee, ShiftCode>,
+  days: DayInfo[],
+  parsed: ParsedEmployeeInput[],
+) {
+  const mEmployeeIndex = EMPLOYEES.findIndex((employee) => row[employee] === "M");
+  if (mEmployeeIndex < 0) return 0;
+  let penalty = days[dayIndex].isRestDay ? 0 : 300;
+  for (const adjacentDay of [dayIndex, dayIndex + 2]) {
+    if (adjacentDay < 1 || adjacentDay > days.length) continue;
+    if (parsed.some((input) => input.vacation.has(adjacentDay))) penalty += 180;
+    const adjacentRequest = normalizeShift(parsed[mEmployeeIndex].requests.get(adjacentDay));
+    if (adjacentRequest === "D") penalty += 220;
+    if (adjacentRequest === "N" || normalizeShift(parsed[mEmployeeIndex].requests.get(adjacentDay - 1)) === "N") penalty += 180;
+  }
+  return penalty;
+}
+
+function beamStateScore(state: BeamState, fairness: PreviousMonthFairness, quota: MonthlyQuotaPlan) {
   const variancePenalty = (values: number[]) => {
     const average = values.reduce((sum, value) => sum + value, 0) / values.length;
     return values.reduce((sum, value) => sum + (value - average) ** 2, 0);
   };
-  const progress = state.schedule.length / fairness.currentMonthLength;
+  const progress = state.dayCount / fairness.currentMonthLength;
   const offTargetPenalty = state.offCounts.reduce(
-    (sum, count, index) => sum + (count - fairness.currentOffTargets[index] * progress) ** 2,
+    (sum, count, index) => sum + (count - quota.offTargets[index] * progress) ** 2,
     0,
   );
+  const workTargetPenalty = state.workCounts.reduce(
+    (sum, count, index) => sum + (count - quota.workTargets[index] * progress) ** 2,
+    0,
+  );
+  const expectedMProgress = quota.requiredM * progress;
+  const mProgressPenalty = (state.totalMCount - expectedMProgress) ** 2;
+  const nProgressPenalty = state.nDayCounts.reduce(
+    (sum, count, index) => sum + (count - quota.nTargets[index] * progress) ** 2,
+    0,
+  );
+  const nUrgencyPenalty = state.remainingNNeeded.reduce((sum, remaining, index) => {
+    if (remaining <= 0) return sum;
+    const legalDays = Math.max(1, state.remainingLegalNDays[index]);
+    return sum + (remaining / legalDays) ** 2 * 1200;
+  }, 0);
+  const offReservationPenalty = state.remainingOffNeeded.reduce((sum, remaining, index) => {
+    const discretionarySlack = remaining - state.knownFutureMandatoryOffCounts[index];
+    return sum + (discretionarySlack <= 1 ? (2 - discretionarySlack) * 900 : 0);
+  }, 0);
+  const desiredMWeight = progress < 0.75 ? 400 : 5000;
   return (
     state.spacingRelaxations * 120000 +
     state.nODRelaxations * 240000 +
@@ -2099,35 +2332,36 @@ function beamStateScore(state: BeamState, fairness: PreviousMonthFairness) {
     variancePenalty(state.shiftCounts.map((counts) => counts.E)) * 8 +
     variancePenalty(state.workCounts) * 12 +
     variancePenalty(state.offCounts) * 8 -
-    state.desiredMAssigned * 100000 +
-    offTargetPenalty * 24 +
+    state.desiredMAssigned * desiredMWeight +
+    offTargetPenalty * 600 +
+    workTargetPenalty * 450 +
+    mProgressPenalty * 700 +
+    nProgressPenalty * 150 +
+    nUrgencyPenalty +
+    offReservationPenalty +
+    state.urgencyPenalty +
     previousFairnessScore(state, fairness)
   );
 }
 
-function beamStateKey(state: BeamState) {
+function beamQuotaSignature(state: BeamState) {
   return [
+    state.remainingOffNeeded.join(","),
+    state.remainingWorkNeeded.join(","),
+    state.remainingNNeeded.join(","),
+    state.remainingMNeeded,
     state.lastShift.join(","),
     state.workStreak.join(","),
     state.nStreak.join(","),
+    state.nBlockCounts.join(","),
     state.lastNBlockEnd.join(","),
+    state.tripleN,
     state.pendingRecovery.map(Number).join(""),
     state.nODForbidden.map(Number).join(""),
-    state.nDayCounts.join(","),
-    state.nBlockCounts.join(","),
-    state.shiftCounts.map((counts) => `${counts.D},${counts.E},${counts.M},${counts.N}`).join(";"),
-    state.workCounts.join(","),
-    state.offCounts.join(","),
-    state.singleN,
-    state.doubleN,
-    state.tripleN,
-    state.desiredMAssigned,
-    state.spacingRelaxations,
-    state.nODRelaxations,
   ].join("|");
 }
 
-function expandBeamState(
+function expandBeamStateCore(
   state: BeamState,
   row: Record<Employee, ShiftCode>,
   dayIndex: number,
@@ -2135,10 +2369,23 @@ function expandBeamState(
   parsed: ParsedEmployeeInput[],
   tier: IntegratedTier,
   fairness: PreviousMonthFairness,
+  quota: MonthlyQuotaPlan,
+  remainingStaticMCapacity: number,
+  remainingForcedMCount: number,
+  nightAvailability: boolean[][],
+  futureAvailability: FutureQuotaAvailability,
+  scoreState = true,
 ) {
+  const currentMandatoryOff = EMPLOYEES.map(
+    (employee, employeeIndex) =>
+      parsed[employeeIndex].fixedOff.has(dayIndex + 1) ||
+      state.pendingRecovery[employeeIndex] ||
+      (state.nStreak[employeeIndex] > 0 && row[employee] !== "N"),
+  );
   const next: BeamState = {
     ...state,
-    schedule: [...state.schedule, { ...row }],
+    history: { row, previous: state.history },
+    dayCount: state.dayCount + 1,
     lastShift: [...state.lastShift],
     workStreak: [...state.workStreak],
     nStreak: [...state.nStreak],
@@ -2150,6 +2397,11 @@ function expandBeamState(
     shiftCounts: state.shiftCounts.map((counts) => ({ ...counts })),
     offCounts: [...state.offCounts],
     workCounts: [...state.workCounts],
+    remainingOffNeeded: [...state.remainingOffNeeded],
+    remainingWorkNeeded: [...state.remainingWorkNeeded],
+    remainingNNeeded: [...state.remainingNNeeded],
+    knownFutureMandatoryOffCounts: [...state.knownFutureMandatoryOffCounts],
+    remainingLegalNDays: [...state.remainingLegalNDays],
   };
 
   for (let employeeIndex = 0; employeeIndex < EMPLOYEES.length; employeeIndex += 1) {
@@ -2186,9 +2438,11 @@ function expandBeamState(
         next.nStreak[employeeIndex] = 1;
       }
       next.nDayCounts[employeeIndex] += 1;
-      const maxNightCount = Math.ceil(days.length / EMPLOYEES.length);
-      if (next.nDayCounts[employeeIndex] > maxNightCount) {
-        return { ok: false as const, reason: `${employee} day ${dayIndex + 1}: exact N target exceeded` };
+      if (next.nDayCounts[employeeIndex] > quota.nTargets[employeeIndex]) {
+        return {
+          ok: false as const,
+          reason: `${employee} day ${dayIndex + 1}: assigning N would make N ${next.nDayCounts[employeeIndex]}, exceeding exact target ${quota.nTargets[employeeIndex]}.`,
+        };
       }
     } else if (wasInNightBlock) {
       closeNightBlock(next, employeeIndex, dayIndex - 1);
@@ -2197,37 +2451,343 @@ function expandBeamState(
     const nextWorkStreak = isOff ? 0 : state.workStreak[employeeIndex] + 1;
     if (nextWorkStreak > 5) return { ok: false as const, reason: `${employee} day ${dayIndex + 1}: max consecutive work conflict` };
     const nextWorkCount = state.workCounts[employeeIndex] + (isOff ? 0 : 1);
-    if (nextWorkCount > days.length - parsed[employeeIndex].minOff) {
-      return { ok: false as const, reason: `${employee} day ${dayIndex + 1}: minOff capacity conflict` };
-    }
-
     next.workStreak[employeeIndex] = nextWorkStreak;
     next.workCounts[employeeIndex] = nextWorkCount;
     if (isOff) next.offCounts[employeeIndex] += 1;
     else next.shiftCounts[employeeIndex][shift] += 1;
     const remainingDays = days.length - dayIndex - 1;
-    const minNightCount = Math.floor(days.length / EMPLOYEES.length);
-    if (next.nDayCounts[employeeIndex] + remainingDays < minNightCount) {
-      return { ok: false as const, reason: `${employee} day ${dayIndex + 1}: exact N target cannot be reached` };
+    const offTarget = quota.offTargets[employeeIndex];
+    const workTarget = quota.workTargets[employeeIndex];
+    if (next.offCounts[employeeIndex] > offTarget) {
+      return {
+        ok: false as const,
+        reason: `${employee} day ${dayIndex + 1}: assigning OFF would make OFF ${next.offCounts[employeeIndex]}, exceeding target ${offTarget}.`,
+      };
     }
-    const maxOff = parsed[employeeIndex].minOff + (parsed[employeeIndex].vacation.size > 0 ? 1 : 0);
-    if (next.offCounts[employeeIndex] > maxOff) {
-      return { ok: false as const, reason: `${employee} day ${dayIndex + 1}: OFF target exceeded` };
+    if (next.offCounts[employeeIndex] + remainingDays < offTarget) {
+      return {
+        ok: false as const,
+        reason: `${employee} day ${dayIndex + 1}: requires ${offTarget - next.offCounts[employeeIndex]} more OFF with only ${remainingDays} days remaining.`,
+      };
     }
-    if (next.offCounts[employeeIndex] + remainingDays < parsed[employeeIndex].minOff) {
-      return { ok: false as const, reason: `${employee} day ${dayIndex + 1}: OFF target cannot be reached` };
+    if (next.workCounts[employeeIndex] > workTarget) {
+      return { ok: false as const, reason: `${employee} day ${dayIndex + 1}: work target ${workTarget} already exceeded.` };
     }
+    if (next.workCounts[employeeIndex] + remainingDays < workTarget) {
+      return {
+        ok: false as const,
+        reason: `${employee} day ${dayIndex + 1}: requires ${workTarget - next.workCounts[employeeIndex]} more work with only ${remainingDays} days remaining.`,
+      };
+    }
+    next.remainingOffNeeded[employeeIndex] = offTarget - next.offCounts[employeeIndex];
+    next.remainingWorkNeeded[employeeIndex] = workTarget - next.workCounts[employeeIndex];
+    next.remainingNNeeded[employeeIndex] = quota.nTargets[employeeIndex] - next.nDayCounts[employeeIndex];
     next.pendingRecovery[employeeIndex] = false;
     next.nODForbidden[employeeIndex] = (state.pendingRecovery[employeeIndex] || (wasInNightBlock && shift !== "N")) && isOff;
     next.lastShift[employeeIndex] = normalized;
   }
 
+  const rowHasM = EMPLOYEES.some((employee) => row[employee] === "M");
+  next.totalMCount = state.totalMCount + (rowHasM ? 1 : 0);
+  next.remainingMNeeded = quota.requiredM - next.totalMCount;
+  if (rowHasM) next.urgencyPenalty += mPlacementPreferencePenalty(dayIndex, row, days, parsed);
+  if (next.remainingMNeeded < 0) {
+    return { ok: false as const, reason: `Required M ${quota.requiredM} already exceeded; current ${next.totalMCount}.` };
+  }
+  if (next.remainingMNeeded > remainingStaticMCapacity) {
+    return {
+      ok: false as const,
+      reason: `Required M ${quota.requiredM} cannot be reached; current ${next.totalMCount}, maximum remaining ${remainingStaticMCapacity}.`,
+    };
+  }
+  if (next.remainingMNeeded < remainingForcedMCount) {
+    return {
+      ok: false as const,
+      reason: `Required M ${quota.requiredM} would be exceeded: current ${next.totalMCount}, with ${remainingForcedMCount} requested M day(s) still remaining.`,
+    };
+  }
+  const remainingDays = days.length - dayIndex - 1;
+  for (let employeeIndex = 0; employeeIndex < EMPLOYEES.length; employeeIndex += 1) {
+    const employee = EMPLOYEES[employeeIndex];
+    const mandatoryInfo = knownFutureMandatoryOffInfo(
+      next,
+      employeeIndex,
+      dayIndex,
+      days,
+      quota,
+      nightAvailability,
+      futureAvailability,
+    );
+    const mandatoryFutureOffCount = mandatoryInfo.mandatoryCount;
+    next.knownFutureMandatoryOffCounts[employeeIndex] = mandatoryFutureOffCount;
+    if (next.offCounts[employeeIndex] + mandatoryFutureOffCount > quota.offTargets[employeeIndex]) {
+      const dateList = [
+        ...mandatoryInfo.dates,
+        ...(mandatoryInfo.forcedRecoveryDay === null ? [] : [mandatoryInfo.forcedRecoveryDay]),
+      ]
+        .sort((a, b) => a - b)
+        .join(", ");
+      return {
+        ok: false as const,
+        reason: `${employee} after day ${dayIndex + 1}: current OFF ${next.offCounts[employeeIndex]} plus ${mandatoryFutureOffCount} known future fixed/vacation/recovery OFF dates exceeds target ${quota.offTargets[employeeIndex]}${dateList ? ` (days ${dateList})` : ""}.`,
+      };
+    }
+    const futureLegalWorkUpperBound = remainingDays - mandatoryFutureOffCount;
+    const remainingWorkNeeded = quota.workTargets[employeeIndex] - next.workCounts[employeeIndex];
+    if (remainingWorkNeeded > futureLegalWorkUpperBound) {
+      return {
+        ok: false as const,
+        reason: `${employee} after day ${dayIndex + 1}: needs ${remainingWorkNeeded} more workdays but has at most ${futureLegalWorkUpperBound} legally available future work dates.`,
+      };
+    }
+    const remainingLegalNDays = mandatoryInfo.legalNightCount;
+    next.remainingLegalNDays[employeeIndex] = remainingLegalNDays;
+    const remainingNNeeded = quota.nTargets[employeeIndex] - next.nDayCounts[employeeIndex];
+    if (remainingNNeeded > remainingLegalNDays) {
+      return {
+        ok: false as const,
+        reason: `${employee} after day ${dayIndex + 1}: needs ${remainingNNeeded} more N shifts but has only ${remainingLegalNDays} legal future N dates for exact target ${quota.nTargets[employeeIndex]}.`,
+      };
+    }
+    const discretionarySlackBeforeCurrentOff = quota.offTargets[employeeIndex] - state.offCounts[employeeIndex] - mandatoryFutureOffCount;
+    if (row[employee] === "/" && !currentMandatoryOff[employeeIndex] && discretionarySlackBeforeCurrentOff <= 1) {
+      next.urgencyPenalty += 2500;
+    }
+  }
+
   if (days[dayIndex].isRestDay && EMPLOYEES.some((employee) => row[employee] === "M")) next.desiredMAssigned += 1;
-  next.score = beamStateScore(next, fairness);
+  if (scoreState) next.score = beamStateScore(next, fairness, quota);
   return { ok: true as const, state: next };
 }
 
-function finalizeBeamState(state: BeamState, fairness: PreviousMonthFairness) {
+type LookaheadCacheEntry = { feasible: true } | { feasible: false; reason: string };
+
+type DailyPatternRow = Record<Employee, ShiftCode>;
+
+type IntegratedStaticData = {
+  dailyPatterns: ReturnType<typeof enumerateDailyPatterns>[];
+  nightAvailability: boolean[][];
+  futureAvailability: FutureQuotaAvailability;
+  remainingStaticMCapacity: number[];
+  remainingForcedMCount: number[];
+  nextPatternCompatibility: Map<DailyPatternRow, DailyPatternRow[]>[];
+  dayConstraintSignatures: string[];
+  vacationDateCount: number;
+};
+
+function staticRowsCompatible(today: DailyPatternRow, tomorrow: DailyPatternRow) {
+  return EMPLOYEES.every((employee) => !conflictsWithKnownNextDayRequest(today[employee], normalizeShift(tomorrow[employee])));
+}
+
+function buildIntegratedStaticData(
+  days: DayInfo[],
+  parsed: ParsedEmployeeInput[],
+  dailyPatterns: ReturnType<typeof enumerateDailyPatterns>[],
+): IntegratedStaticData {
+  const nightAvailability = staticNightAvailability(dailyPatterns);
+  const requestedRecoveryDates = requestedNightRecoveryDates(parsed, days, nightAvailability);
+  const futureAvailability = buildFutureQuotaAvailability(parsed, days, nightAvailability, requestedRecoveryDates);
+  const remainingStaticMCapacity = Array.from({ length: days.length + 1 }, () => 0);
+  const remainingForcedMCount = Array.from({ length: days.length + 1 }, () => 0);
+  for (let index = days.length - 1; index >= 0; index -= 1) {
+    const patterns = dailyPatterns[index].patterns;
+    const canAssignM = patterns.some((row) => EMPLOYEES.some((employee) => row[employee] === "M"));
+    const mustAssignM = patterns.length > 0 && patterns.every((row) => EMPLOYEES.some((employee) => row[employee] === "M"));
+    remainingStaticMCapacity[index] = remainingStaticMCapacity[index + 1] + (canAssignM ? 1 : 0);
+    remainingForcedMCount[index] = remainingForcedMCount[index + 1] + (mustAssignM ? 1 : 0);
+  }
+  const nextPatternCompatibility = dailyPatterns.map(({ patterns }, dayIndex) => {
+    const result = new Map<DailyPatternRow, DailyPatternRow[]>();
+    const nextPatterns = dailyPatterns[dayIndex + 1]?.patterns ?? [];
+    patterns.forEach((row) => result.set(row, nextPatterns.filter((nextRow) => staticRowsCompatible(row, nextRow))));
+    return result;
+  });
+  const dayConstraintSignatures = days.map((dayInfo) =>
+    [
+      dayInfo.day,
+      parsed.some((input) => input.vacation.has(dayInfo.day)) ? "V" : "-",
+      ...parsed.map((input) => `${input.fixedOff.has(dayInfo.day) ? "O" : "-"}${normalizeShift(input.requests.get(dayInfo.day)) ?? "-"}`),
+    ].join(":"),
+  );
+  return {
+    dailyPatterns,
+    nightAvailability,
+    futureAvailability,
+    remainingStaticMCapacity,
+    remainingForcedMCount,
+    nextPatternCompatibility,
+    dayConstraintSignatures,
+    vacationDateCount: days.filter((dayInfo) => parsed.some((input) => input.vacation.has(dayInfo.day))).length,
+  };
+}
+
+function probeNextDayPatternFeasible(
+  state: BeamState,
+  row: DailyPatternRow,
+  dayIndex: number,
+  days: DayInfo[],
+  parsed: ParsedEmployeeInput[],
+  tier: IntegratedTier,
+  quota: MonthlyQuotaPlan,
+  remainingStaticMCapacity: number,
+  remainingForcedMCount: number,
+  nightAvailability: boolean[][],
+  futureAvailability: FutureQuotaAvailability,
+) {
+  const rowHasM = EMPLOYEES.some((employee) => row[employee] === "M");
+  const tripleNAfterRow =
+    state.tripleN +
+    EMPLOYEES.filter((employee, employeeIndex) => state.nStreak[employeeIndex] === 3 && row[employee] !== "N").length;
+  const remainingMNeeded = state.remainingMNeeded - (rowHasM ? 1 : 0);
+  if (remainingMNeeded < 0) return `Required M ${quota.requiredM} would be exceeded on day ${dayIndex + 1}.`;
+  if (remainingMNeeded > remainingStaticMCapacity) {
+    return `Remaining M capacity conflict after day ${dayIndex + 1}: needs ${remainingMNeeded}, capacity ${remainingStaticMCapacity}.`;
+  }
+  if (remainingMNeeded < remainingForcedMCount) {
+    return `Required M ${quota.requiredM} would be exceeded by ${remainingForcedMCount} forced future M day(s).`;
+  }
+
+  for (let employeeIndex = 0; employeeIndex < EMPLOYEES.length; employeeIndex += 1) {
+    const employee = EMPLOYEES[employeeIndex];
+    const shift = row[employee];
+    const isOff = shift === "/";
+    const wasInNightBlock = state.nStreak[employeeIndex] > 0;
+    const closesNightBlock = wasInNightBlock && shift !== "N";
+    const recoveryRequired = state.pendingRecovery[employeeIndex] || closesNightBlock;
+    if (recoveryRequired && !isOff) return `${employee} day ${dayIndex + 1}: recovery OFF conflict`;
+    if (shift === "D" && isEveningLike(state.lastShift[employeeIndex])) return `${employee} day ${dayIndex + 1}: E/M -> D conflict`;
+    if (state.nODForbidden[employeeIndex] && shift === "D" && tier < 3) return `${employee} day ${dayIndex + 1}: N-O-D conflict`;
+
+    let nStreak = 0;
+    let nDayCount = state.nDayCounts[employeeIndex];
+    if (shift === "N") {
+      if (wasInNightBlock) {
+        if (state.nStreak[employeeIndex] >= 3) return `${employee} day ${dayIndex + 1}: NNNN+ conflict`;
+        if (state.nStreak[employeeIndex] === 2 && (days.length % 2 === 0 || state.tripleN > 0)) {
+          return "NNN is only allowed at most once in odd-total-N months.";
+        }
+        nStreak = state.nStreak[employeeIndex] + 1;
+      } else {
+        const lastEnd = state.lastNBlockEnd[employeeIndex];
+        if (lastEnd !== null && dayIndex - lastEnd < MIN_N_BLOCK_START_GAP && tier < 2) {
+          return `${employee} day ${dayIndex + 1}: N spacing conflict`;
+        }
+        nStreak = 1;
+      }
+      nDayCount += 1;
+      if (nDayCount > quota.nTargets[employeeIndex]) return `${employee} day ${dayIndex + 1}: exact N target exceeded`;
+    }
+
+    const workStreak = isOff ? 0 : state.workStreak[employeeIndex] + 1;
+    if (workStreak > 5) return `${employee} day ${dayIndex + 1}: max consecutive work conflict`;
+    const offCount = state.offCounts[employeeIndex] + (isOff ? 1 : 0);
+    const workCount = state.workCounts[employeeIndex] + (isOff ? 0 : 1);
+    const remainingDays = days.length - dayIndex - 1;
+    if (offCount > quota.offTargets[employeeIndex] || offCount + remainingDays < quota.offTargets[employeeIndex]) {
+      return `${employee} day ${dayIndex + 1}: exact OFF target conflict`;
+    }
+    if (workCount > quota.workTargets[employeeIndex] || workCount + remainingDays < quota.workTargets[employeeIndex]) {
+      return `${employee} day ${dayIndex + 1}: exact work target conflict`;
+    }
+
+    const dates = futureAvailability.mandatoryDates[dayIndex][employeeIndex];
+    const followingDayIndex = dayIndex + 1;
+    const canContinueNight =
+      nStreak > 0 &&
+      followingDayIndex < days.length &&
+      nDayCount < quota.nTargets[employeeIndex] &&
+      nightAvailability[followingDayIndex][employeeIndex] &&
+      nStreak < 3 &&
+      !(nStreak === 2 && (days.length % 2 === 0 || tripleNAfterRow > 0));
+    const forcedRecoveryDay = nStreak > 0 && !canContinueNight && followingDayIndex < days.length ? followingDayIndex + 1 : null;
+    const additionalRecovery = forcedRecoveryDay !== null && !dates.has(forcedRecoveryDay);
+    const mandatoryFutureOffCount = dates.size + (additionalRecovery ? 1 : 0);
+    if (offCount + mandatoryFutureOffCount > quota.offTargets[employeeIndex]) {
+      return `${employee} after day ${dayIndex + 1}: future mandatory OFF capacity conflict`;
+    }
+    if (quota.workTargets[employeeIndex] - workCount > remainingDays - mandatoryFutureOffCount) {
+      return `${employee} after day ${dayIndex + 1}: future legal work capacity conflict`;
+    }
+    const legalNightCount =
+      futureAvailability.legalNightCounts[dayIndex][employeeIndex] -
+      (additionalRecovery && nightAvailability[followingDayIndex]?.[employeeIndex] ? 1 : 0);
+    if (quota.nTargets[employeeIndex] - nDayCount > legalNightCount) {
+      return `${employee} after day ${dayIndex + 1}: future legal N capacity conflict`;
+    }
+  }
+  return null;
+}
+
+function forwardCheckCandidate(
+  state: BeamState,
+  currentRow: DailyPatternRow,
+  dayIndex: number,
+  days: DayInfo[],
+  parsed: ParsedEmployeeInput[],
+  tier: IntegratedTier,
+  quota: MonthlyQuotaPlan,
+  staticData: IntegratedStaticData,
+  lookaheadCache: Map<string, LookaheadCacheEntry>,
+  metrics: BeamDayMetrics,
+) {
+  if (dayIndex + 1 >= days.length) return { ok: true as const };
+  metrics.forwardCheckCalls += 1;
+  const nextDayIndex = dayIndex + 1;
+  const cacheKey = [
+    nextDayIndex,
+    `spacing:${tier >= 2 ? 1 : 0}`,
+    `nod:${tier >= 3 ? 1 : 0}`,
+    quota.offTargets.join(","),
+    quota.workTargets.join(","),
+    quota.nTargets.join(","),
+    state.remainingOffNeeded.join(","),
+    state.remainingWorkNeeded.join(","),
+    state.remainingNNeeded.join(","),
+    state.remainingMNeeded,
+    beamQuotaSignature(state),
+    staticData.dayConstraintSignatures[nextDayIndex],
+  ].join("|");
+  const cached = lookaheadCache.get(cacheKey);
+  if (cached) {
+    metrics.forwardCheckCacheHits += 1;
+    if ("reason" in cached) return { ok: false as const, reason: cached.reason };
+    return { ok: true as const };
+  }
+
+  const reasonCounts = new Map<string, number>();
+  const nextPatterns = staticData.nextPatternCompatibility[dayIndex].get(currentRow) ?? [];
+  for (const nextRow of nextPatterns) {
+    metrics.nextDayPatternProbes += 1;
+    const reason = probeNextDayPatternFeasible(
+      state,
+      nextRow,
+      nextDayIndex,
+      days,
+      parsed,
+      tier,
+      quota,
+      staticData.remainingStaticMCapacity[nextDayIndex + 1],
+      staticData.remainingForcedMCount[nextDayIndex + 1],
+      staticData.nightAvailability,
+      staticData.futureAvailability,
+    );
+    if (reason === null) {
+      lookaheadCache.set(cacheKey, { feasible: true });
+      return { ok: true as const };
+    }
+    if (reason.startsWith("Remaining M capacity conflict")) metrics.remainingMCapacityRejections += 1;
+    reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1);
+  }
+  const topReasons = [...reasonCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([reason]) => reason);
+  const reason = `After day ${dayIndex + 1}, no valid day ${dayIndex + 2} continuation exists${topReasons.length > 0 ? `: ${topReasons.join(" / ")}` : ""}.`;
+  lookaheadCache.set(cacheKey, { feasible: false, reason });
+  return { ok: false as const, reason };
+}
+
+function finalizeBeamState(state: BeamState, fairness: PreviousMonthFairness, quota: MonthlyQuotaPlan) {
   const final = {
     ...state,
     nStreak: [...state.nStreak],
@@ -2235,10 +2795,110 @@ function finalizeBeamState(state: BeamState, fairness: PreviousMonthFairness) {
     lastNBlockEnd: [...state.lastNBlockEnd],
   };
   EMPLOYEES.forEach((_, employeeIndex) => {
-    if (final.nStreak[employeeIndex] > 0) closeNightBlock(final, employeeIndex, final.schedule.length - 1);
+    if (final.nStreak[employeeIndex] > 0) closeNightBlock(final, employeeIndex, final.dayCount - 1);
   });
-  final.score = beamStateScore(final, fairness);
+  const schedule = Array.from({ length: final.dayCount }) as Schedule;
+  let history = final.history;
+  for (let dayIndex = final.dayCount - 1; dayIndex >= 0 && history; dayIndex -= 1) {
+    schedule[dayIndex] = history.row;
+    history = history.previous;
+  }
+  final.schedule = schedule;
+  final.score = beamStateScore(final, fairness, quota);
   return final;
+}
+
+type BeamCandidate = { state: BeamState; row: DailyPatternRow; order: number };
+
+function configuredSolverTimeBudgetMs() {
+  const value = (globalThis as typeof globalThis & { __EMT_SOLVER_TIME_BUDGET_MS__?: unknown }).__EMT_SOLVER_TIME_BUDGET_MS__;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function boundedBest<T>(items: Iterable<T>, limit: number, compare: (a: T, b: T) => number) {
+  if (limit <= 0) return [];
+  const heap: T[] = [];
+  const swap = (a: number, b: number) => {
+    [heap[a], heap[b]] = [heap[b], heap[a]];
+  };
+  const bubbleUp = (index: number) => {
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (compare(heap[parent], heap[index]) >= 0) break;
+      swap(parent, index);
+      index = parent;
+    }
+  };
+  const sinkDown = (index: number) => {
+    while (true) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let worst = index;
+      if (left < heap.length && compare(heap[left], heap[worst]) > 0) worst = left;
+      if (right < heap.length && compare(heap[right], heap[worst]) > 0) worst = right;
+      if (worst === index) break;
+      swap(index, worst);
+      index = worst;
+    }
+  };
+  for (const item of items) {
+    if (heap.length < limit) {
+      heap.push(item);
+      bubbleUp(heap.length - 1);
+    } else if (compare(item, heap[0]) < 0) {
+      heap[0] = item;
+      sinkDown(0);
+    }
+  }
+  return heap.sort(compare);
+}
+
+function createMinHeap<T>(items: Iterable<T>, compare: (a: T, b: T) => number) {
+  const heap: T[] = [];
+  const push = (item: T) => {
+    heap.push(item);
+    let index = heap.length - 1;
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (compare(heap[parent], heap[index]) <= 0) break;
+      [heap[parent], heap[index]] = [heap[index], heap[parent]];
+      index = parent;
+    }
+  };
+  for (const item of items) push(item);
+  return {
+    get size() {
+      return heap.length;
+    },
+    pop() {
+      const first = heap[0];
+      const last = heap.pop();
+      if (heap.length > 0 && last !== undefined) {
+        heap[0] = last;
+        let index = 0;
+        while (true) {
+          const left = index * 2 + 1;
+          const right = left + 1;
+          let best = index;
+          if (left < heap.length && compare(heap[left], heap[best]) < 0) best = left;
+          if (right < heap.length && compare(heap[right], heap[best]) < 0) best = right;
+          if (best === index) break;
+          [heap[index], heap[best]] = [heap[best], heap[index]];
+          index = best;
+        }
+      }
+      return first;
+    },
+  };
+}
+
+function performanceDiagnostics(metrics: SolverPerformanceMetrics, quota: MonthlyQuotaPlan, tier: IntegratedTier) {
+  const header = `Solver timing: ${quota.name}; Tier ${tier}; N vector ${quota.nTargets.join("/")}; ${Math.round(metrics.elapsedMs)} ms; forward checks ${metrics.forwardCheckCalls}; cache hits ${metrics.forwardCheckCacheHits}; probes ${metrics.nextDayPatternProbes}; remaining-M-capacity rejections ${metrics.remainingMCapacityRejections}.`;
+  const days = metrics.days.map(
+    (day) =>
+      `Day ${day.day} timing: states ${day.currentStates}; attempts ${day.patternAttempts}; direct successes ${day.successfulDirectExpansions}; forward calls ${day.forwardCheckCalls}; cache hits ${day.forwardCheckCacheHits}; probes ${day.nextDayPatternProbes}; unique signatures ${day.uniqueSignatures}; M-capacity rejections ${day.remainingMCapacityRejections}; ${Math.round(day.elapsedMs)} ms.`,
+  );
+  return [header, ...days];
 }
 
 function integratedBeamSolve(
@@ -2247,52 +2907,192 @@ function integratedBeamSolve(
   tier: IntegratedTier,
   variant: number,
   fairness: PreviousMonthFairness,
+  quota: MonthlyQuotaPlan,
+  staticData: IntegratedStaticData,
 ): IntegratedSolveResult {
   const beamWidth = 2000;
-  let beam: BeamState[] = [initialBeamState(parsed)];
-  let firstFailure: string[] = [];
+  const statesPerQuotaSignature = 3;
+  const startedAt = performance.now();
+  const timeBudgetMs = configuredSolverTimeBudgetMs();
+  const metrics: SolverPerformanceMetrics = {
+    elapsedMs: 0,
+    forwardCheckCalls: 0,
+    forwardCheckCacheHits: 0,
+    nextDayPatternProbes: 0,
+    remainingMCapacityRejections: 0,
+    days: [],
+  };
+  const lookaheadCache = new Map<string, LookaheadCacheEntry>();
+  let beam: BeamState[] = [initialBeamState(parsed, quota)];
+  let candidateOrder = 0;
 
   for (let dayIndex = 0; dayIndex < days.length; dayIndex += 1) {
-    const { patterns, staticFailures } = enumerateDailyPatterns(dayIndex, parsed, days);
-    const expanded: BeamState[] = [];
-    const reasonCounts = new Map<string, number>();
+    const dayStartedAt = performance.now();
+    const dayMetrics: BeamDayMetrics = {
+      day: dayIndex + 1,
+      currentStates: beam.length,
+      patternAttempts: 0,
+      successfulDirectExpansions: 0,
+      forwardCheckCalls: 0,
+      forwardCheckCacheHits: 0,
+      nextDayPatternProbes: 0,
+      uniqueSignatures: 0,
+      remainingMCapacityRejections: 0,
+      elapsedMs: 0,
+    };
+    const { patterns, staticFailures } = staticData.dailyPatterns[dayIndex];
+    const withM = patterns.filter((row) => EMPLOYEES.some((employee) => row[employee] === "M"));
+    const withoutM = patterns.filter((row) => !EMPLOYEES.some((employee) => row[employee] === "M"));
+    const candidatesBySignature = new Map<string, BeamCandidate[]>();
+    const directReasonCounts = new Map<string, number>();
+    const forwardReasonCounts = new Map<string, number>();
+    const compareCandidates = (a: BeamCandidate, b: BeamCandidate) =>
+      a.state.score - b.state.score ||
+      seededNoise(variant, dayIndex, a.state.nDayCounts[0], a.state.desiredMAssigned) -
+        seededNoise(variant, dayIndex, b.state.nDayCounts[0], b.state.desiredMAssigned) ||
+      a.order - b.order;
     for (const state of beam) {
-      for (const row of patterns) {
-        const result = expandBeamState(state, row, dayIndex, days, parsed, tier, fairness);
-        if (result.ok) expanded.push(result.state);
-        else reasonCounts.set(result.reason, (reasonCounts.get(result.reason) ?? 0) + 1);
+      const mNeededPerDay = state.remainingMNeeded / Math.max(1, days.length - dayIndex);
+      const patternGroups = mNeededPerDay >= 0.5 ? [withM, withoutM] : [withoutM, withM];
+      for (const patternGroup of patternGroups) {
+        for (const row of patternGroup) {
+          dayMetrics.patternAttempts += 1;
+          const precheckReason = probeNextDayPatternFeasible(
+            state,
+            row,
+            dayIndex,
+            days,
+            parsed,
+            tier,
+            quota,
+            staticData.remainingStaticMCapacity[dayIndex + 1],
+            staticData.remainingForcedMCount[dayIndex + 1],
+            staticData.nightAvailability,
+            staticData.futureAvailability,
+          );
+          if (precheckReason !== null) {
+            directReasonCounts.set(precheckReason, (directReasonCounts.get(precheckReason) ?? 0) + 1);
+            if (precheckReason.startsWith("Remaining M capacity conflict")) dayMetrics.remainingMCapacityRejections += 1;
+            continue;
+          }
+          const result = expandBeamStateCore(
+            state,
+            row,
+            dayIndex,
+            days,
+            parsed,
+            tier,
+            fairness,
+            quota,
+            staticData.remainingStaticMCapacity[dayIndex + 1],
+            staticData.remainingForcedMCount[dayIndex + 1],
+            staticData.nightAvailability,
+            staticData.futureAvailability,
+          );
+          if (!result.ok) {
+            directReasonCounts.set(result.reason, (directReasonCounts.get(result.reason) ?? 0) + 1);
+            if (result.reason.includes("maximum remaining")) dayMetrics.remainingMCapacityRejections += 1;
+            continue;
+          }
+          dayMetrics.successfulDirectExpansions += 1;
+          const candidate = { state: result.state, row, order: candidateOrder++ };
+          const signature = beamQuotaSignature(result.state);
+          const bucket = candidatesBySignature.get(signature) ?? [];
+          bucket.push(candidate);
+          bucket.sort(compareCandidates);
+          if (bucket.length > statesPerQuotaSignature) bucket.length = statesPerQuotaSignature;
+          candidatesBySignature.set(signature, bucket);
+          if (timeBudgetMs !== null && dayMetrics.patternAttempts % 8192 === 0 && performance.now() - startedAt > timeBudgetMs) break;
+        }
+        if (timeBudgetMs !== null && performance.now() - startedAt > timeBudgetMs) break;
+      }
+      if (timeBudgetMs !== null && performance.now() - startedAt > timeBudgetMs) break;
+    }
+    dayMetrics.uniqueSignatures = candidatesBySignature.size;
+
+    const passingBySignature = new Map<string, BeamCandidate[]>();
+    const primaryHeap = createMinHeap(
+      [...candidatesBySignature.entries()].map(([signature, candidates]) => ({ signature, candidates })),
+      (a, b) => compareCandidates(a.candidates[0], b.candidates[0]),
+    );
+    const selectedPrimary: BeamCandidate[] = [];
+    while (primaryHeap.size > 0 && selectedPrimary.length < beamWidth) {
+      const entry = primaryHeap.pop();
+      if (!entry) break;
+      const candidate = entry.candidates[0];
+      const result = forwardCheckCandidate(
+        candidate.state,
+        candidate.row,
+        dayIndex,
+        days,
+        parsed,
+        tier,
+        quota,
+        staticData,
+        lookaheadCache,
+        dayMetrics,
+      );
+      if (result.ok) {
+        selectedPrimary.push(candidate);
+        passingBySignature.set(entry.signature, entry.candidates);
+      } else {
+        forwardReasonCounts.set(result.reason, (forwardReasonCounts.get(result.reason) ?? 0) + 1);
       }
     }
-    if (expanded.length === 0) {
-      const reasons = [...reasonCounts.entries()]
+
+    dayMetrics.elapsedMs = performance.now() - dayStartedAt;
+    metrics.forwardCheckCalls += dayMetrics.forwardCheckCalls;
+    metrics.forwardCheckCacheHits += dayMetrics.forwardCheckCacheHits;
+    metrics.nextDayPatternProbes += dayMetrics.nextDayPatternProbes;
+    metrics.remainingMCapacityRejections += dayMetrics.remainingMCapacityRejections;
+    metrics.days.push(dayMetrics);
+    metrics.elapsedMs = performance.now() - startedAt;
+    const diagnostics = performanceDiagnostics(metrics, quota, tier);
+    if (timeBudgetMs !== null && metrics.elapsedMs > timeBudgetMs) {
+      return {
+        ok: false,
+        failures: [`Solver diagnostic time budget ${timeBudgetMs} ms exceeded after day ${dayIndex + 1}; no invalid schedule was returned.`],
+        performanceDiagnostics: diagnostics,
+      };
+    }
+    if (passingBySignature.size === 0) {
+      const directReasons = [...directReasonCounts.entries()]
         .sort((a, b) => b[1] - a[1])
         .slice(0, 12)
         .map(([reason, count]) => `${reason} (${count})`);
-      firstFailure = [
+      const forwardReasons = [...forwardReasonCounts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8)
+        .map(([reason, count]) => `${reason} (${count})`);
+      const firstFailure = [
         `First day with no valid daily patterns: day ${dayIndex + 1}.`,
         ...staticFailures,
-        `Candidate rejection reasons: ${reasons.length > 0 ? reasons.join(" / ") : "none"}.`,
+        `Direct rejection reasons: ${directReasons.length > 0 ? directReasons.join(" / ") : "none"}.`,
+        `Forward-check rejection reasons: ${forwardReasons.length > 0 ? forwardReasons.join(" / ") : "none"}.`,
       ];
-      return { ok: false, failures: firstFailure };
+      return { ok: false, failures: firstFailure, performanceDiagnostics: diagnostics };
     }
 
-    const bestByKey = new Map<string, BeamState>();
-    expanded.forEach((state) => {
-      const key = beamStateKey(state);
-      const existing = bestByKey.get(key);
-      if (!existing || state.score < existing.score) bestByKey.set(key, state);
-    });
-    beam = [...bestByKey.values()]
-      .sort((a, b) => a.score - b.score || seededNoise(variant, dayIndex, a.nDayCounts[0], a.desiredMAssigned) - seededNoise(variant, dayIndex, b.nDayCounts[0], b.desiredMAssigned))
-      .slice(0, beamWidth);
+    const remainingSlots = beamWidth - selectedPrimary.length;
+    const selectedSecondary = boundedBest(
+      [...passingBySignature.values()].flatMap((bucket) => bucket.slice(1)),
+      remainingSlots,
+      compareCandidates,
+    );
+    beam = [...selectedPrimary, ...selectedSecondary].map((candidate) => candidate.state);
   }
 
   const valid = beam
-    .map((state) => finalizeBeamState(state, fairness))
-    .filter((state) => validateHard(state.schedule, parsed, days, integratedRelaxations(tier)).length === 0)
+    .map((state) => finalizeBeamState(state, fairness, quota))
+    .filter((state) => validateHard(state.schedule, parsed, days, integratedRelaxations(tier), quota).length === 0)
     .sort((a, b) => a.score - b.score);
   if (valid.length === 0) {
-    return { ok: false, failures: [`Tier ${tier}: beam reached month end but no final schedule passed hard validation.`] };
+    metrics.elapsedMs = performance.now() - startedAt;
+    return {
+      ok: false,
+      failures: [`Tier ${tier}: beam reached month end but no final schedule passed hard validation.`],
+      performanceDiagnostics: performanceDiagnostics(metrics, quota, tier),
+    };
   }
   const state = valid[0];
   const warnings: string[] = [`Tier ${tier} used.`];
@@ -2303,7 +3103,14 @@ function integratedBeamSolve(
   }
   if (state.spacingRelaxations > 0) warnings.push(`N spacing relaxations: ${state.spacingRelaxations}.`);
   if (state.nODRelaxations > 0) warnings.push(`N-O-D relaxations: ${state.nODRelaxations}.`);
-  return { ok: true, state, schedule: state.schedule, warnings };
+  metrics.elapsedMs = performance.now() - startedAt;
+  return {
+    ok: true,
+    state,
+    schedule: state.schedule,
+    warnings,
+    performanceDiagnostics: performanceDiagnostics(metrics, quota, tier),
+  };
 }
 
 function integratedRequestFailures(parsed: ParsedEmployeeInput[], days: DayInfo[]) {
@@ -2312,74 +3119,171 @@ function integratedRequestFailures(parsed: ParsedEmployeeInput[], days: DayInfo[
     input.requests.forEach((code, day) => {
       if (input.fixedOff.has(day)) failures.push(`${EMPLOYEES[employeeIndex]} day ${day}: requested ${code} conflicts with fixedOff/vacation/wantedOff`);
     });
+    for (let day = 1; day < days.length; day += 1) {
+      const requestedToday = normalizeShift(input.requests.get(day));
+      const requestedTomorrow = normalizeShift(input.requests.get(day + 1));
+      if (!requestedToday || requestedToday === "OFF" || !conflictsWithKnownNextDayRequest(requestedToday, requestedTomorrow)) continue;
+      if ((requestedToday === "E" || requestedToday === "M") && requestedTomorrow === "D") {
+        failures.push(
+          `${EMPLOYEES[employeeIndex]} day ${day} requested ${requestedToday} conflicts with requested D on day ${day + 1}.`,
+        );
+      } else if (requestedToday === "N" && requestedTomorrow && requestedTomorrow !== "OFF") {
+        failures.push(
+          `${EMPLOYEES[employeeIndex]} day ${day} requested N conflicts with requested ${requestedTomorrow} on day ${day + 1} because recovery OFF or N is required.`,
+        );
+      }
+    }
   });
   days.forEach((dayInfo) => {
+    const hasVacation = parsed.some((input) => input.vacation.has(dayInfo.day));
     (["D", "E", "M", "N"] as WorkShift[]).forEach((shift) => {
       const owners = EMPLOYEES.filter((_, employeeIndex) => normalizeShift(parsed[employeeIndex].requests.get(dayInfo.day)) === shift);
       if (owners.length > 1) failures.push(`Day ${dayInfo.day}: multiple employees requested ${shift}: ${owners.join(", ")}`);
+      if (shift === "M" && hasVacation && owners.length > 0) {
+        failures.push(`Day ${dayInfo.day}: requested M is forbidden because at least one employee is on vacation.`);
+      }
     });
   });
   return [...new Set(failures)];
 }
 
-function addIntegratedWeekdayCompensation(
-  schedule: Schedule,
+function buildMonthlyQuotaPlan(
+  daysInMonth: number,
+  baseOff: number,
   parsed: ParsedEmployeeInput[],
-  days: DayInfo[],
-  tier: IntegratedTier,
-  requestedCount: number,
-) {
-  const result = schedule.map((row) => ({ ...row })) as Schedule;
-  let assigned = 0;
-  while (assigned < requestedCount) {
-    const candidates: { dayIndex: number; employeeIndex: number; score: number }[] = [];
-    days.forEach((dayInfo, dayIndex) => {
-      if (dayInfo.isRestDay || currentMCount(result, dayIndex) > 0) return;
-      EMPLOYEES.forEach((employee, employeeIndex) => {
-        if (result[dayIndex][employee] !== "/" || parsed[employeeIndex].fixedOff.has(dayInfo.day)) return;
-        const candidate = result.map((row) => ({ ...row })) as Schedule;
-        candidate[dayIndex][employee] = "M";
-        if (validateHard(candidate, parsed, days, integratedRelaxations(tier)).length > 0) return;
-        const stats = computeStats(result, days)[employeeIndex];
-        candidates.push({ dayIndex, employeeIndex, score: stats.totalWork * 10 + stats.evening * 8 + dayIndex / 100 });
-      });
-    });
-    candidates.sort((a, b) => a.score - b.score);
-    const selected = candidates[0];
-    if (!selected) break;
-    result[selected.dayIndex][EMPLOYEES[selected.employeeIndex]] = "M";
-    assigned += 1;
-  }
-  return { schedule: result, assigned };
+  fallbackEmployeeIndexes: number[],
+  nTargets: number[],
+): MonthlyQuotaPlan {
+  const fallbackSet = new Set(fallbackEmployeeIndexes);
+  const offTargets = parsed.map(
+    (input, employeeIndex) => baseOff + (input.vacation.size > 0 ? 2 + (fallbackSet.has(employeeIndex) ? 1 : 0) : 0),
+  );
+  const workTargets = offTargets.map((target) => daysInMonth - target);
+  const requiredTotalWork = workTargets.reduce((sum, target) => sum + target, 0);
+  const requiredCoreWork = daysInMonth * 3;
+  const nFloorTarget = Math.floor(daysInMonth / EMPLOYEES.length);
+  const nRemainder = daysInMonth % EMPLOYEES.length;
+  return {
+    name:
+      fallbackEmployeeIndexes.length === 0
+        ? "Plan A (vacation OFF +2)"
+        : `Vacation OFF +3 plan (${fallbackEmployeeIndexes.map((index) => EMPLOYEES[index]).join(", ")})`,
+    offTargets,
+    workTargets,
+    requiredM: requiredTotalWork - requiredCoreWork,
+    nFloorTarget,
+    nCeilTarget: nFloorTarget + (nRemainder > 0 ? 1 : 0),
+    nRemainder,
+    nTargets,
+    fallbackEmployeeIndexes,
+  };
 }
 
-function reduceVacationOffFallback(
-  schedule: Schedule,
+function employeeIndexCombinations(indexes: number[], size: number) {
+  const result: number[][] = [];
+  const visit = (start: number, selected: number[]) => {
+    if (selected.length === size) {
+      result.push([...selected]);
+      return;
+    }
+    for (let position = start; position <= indexes.length - (size - selected.length); position += 1) {
+      selected.push(indexes[position]);
+      visit(position + 1, selected);
+      selected.pop();
+    }
+  };
+  visit(0, []);
+  return result;
+}
+
+function exactNightTargetVectors(daysInMonth: number) {
+  const floorTarget = Math.floor(daysInMonth / EMPLOYEES.length);
+  const remainder = daysInMonth % EMPLOYEES.length;
+  const employeeIndexes = EMPLOYEES.map((_, employeeIndex) => employeeIndex);
+  return employeeIndexCombinations(employeeIndexes, remainder).map((ceilingIndexes) => {
+    const ceilingSet = new Set(ceilingIndexes);
+    return EMPLOYEES.map((_, employeeIndex) => floorTarget + (ceilingSet.has(employeeIndex) ? 1 : 0));
+  });
+}
+
+function buildMonthlyQuotaPlans(daysInMonth: number, baseOff: number, parsed: ParsedEmployeeInput[]) {
+  const nTargetVectors = exactNightTargetVectors(daysInMonth);
+  const preferred = nTargetVectors.map((nTargets) => buildMonthlyQuotaPlan(daysInMonth, baseOff, parsed, [], nTargets));
+  const vacationIndexes = parsed
+    .map((input, employeeIndex) => (input.vacation.size > 0 ? employeeIndex : -1))
+    .filter((employeeIndex) => employeeIndex >= 0);
+  const fallbacksByCount = new Map<number, MonthlyQuotaPlan[]>();
+  for (let count = 1; count <= vacationIndexes.length; count += 1) {
+    fallbacksByCount.set(
+      count,
+      employeeIndexCombinations(vacationIndexes, count).flatMap((indexes) =>
+        nTargetVectors.map((nTargets) => buildMonthlyQuotaPlan(daysInMonth, baseOff, parsed, indexes, nTargets)),
+      ),
+    );
+  }
+  return { preferred, fallbacksByCount };
+}
+
+function applyMonthlyQuotaPlan(parsed: ParsedEmployeeInput[], quota: MonthlyQuotaPlan) {
+  parsed.forEach((input, employeeIndex) => {
+    input.minOff = quota.offTargets[employeeIndex];
+    input.targetOff = quota.offTargets[employeeIndex];
+  });
+}
+
+function monthlyQuotaSummary(quota: MonthlyQuotaPlan) {
+  return [
+    `OFF plan: ${quota.name}.`,
+    `Selected OFF targets: ${EMPLOYEES.map((employee, index) => `${employee} ${quota.offTargets[index]}`).join(", ")}.`,
+    `Selected work targets: ${EMPLOYEES.map((employee, index) => `${employee} ${quota.workTargets[index]}`).join(", ")}.`,
+    `Required total M: ${quota.requiredM}.`,
+    `N targets: floor ${quota.nFloorTarget}, ceiling ${quota.nCeilTarget}, ceiling employees ${quota.nRemainder}.`,
+    `Exact N targets: ${EMPLOYEES.map((employee, index) => `${employee} ${quota.nTargets[index]}`).join(", ")}.`,
+  ];
+}
+
+function monthlyQuotaPreflightFailures(
+  quota: MonthlyQuotaPlan,
   parsed: ParsedEmployeeInput[],
   days: DayInfo[],
-  tier: IntegratedTier,
+  dailyPatterns: ReturnType<typeof enumerateDailyPatterns>[],
 ) {
-  const result = schedule.map((row) => ({ ...row })) as Schedule;
-  EMPLOYEES.forEach((employee, employeeIndex) => {
-    if (parsed[employeeIndex].vacation.size === 0) return;
-    const offCount = result.filter((row) => row[employee] === "/").length;
-    if (offCount !== parsed[employeeIndex].minOff + 1) return;
-    const candidates: { dayIndex: number; score: number }[] = [];
-    days.forEach((dayInfo, dayIndex) => {
-      if (result[dayIndex][employee] !== "/" || parsed[employeeIndex].fixedOff.has(dayInfo.day) || currentMCount(result, dayIndex) > 0) return;
-      const candidate = result.map((row) => ({ ...row })) as Schedule;
-      candidate[dayIndex][employee] = "M";
-      if (validateHard(candidate, parsed, days, integratedRelaxations(tier)).length > 0) return;
-      candidates.push({ dayIndex, score: dayInfo.isRestDay ? 0 : 1 });
-    });
-    candidates.sort((a, b) => a.score - b.score || a.dayIndex - b.dayIndex);
-    if (candidates[0]) result[candidates[0].dayIndex][employee] = "M";
+  const failures: string[] = [];
+  const nightAvailability = staticNightAvailability(dailyPatterns);
+  const theoreticalMCapacity = dailyPatterns.filter(({ patterns }) =>
+    patterns.some((row) => EMPLOYEES.some((employee) => row[employee] === "M")),
+  ).length;
+  const forcedMDays = days.filter((dayInfo) =>
+    parsed.some((input) => normalizeShift(input.requests.get(dayInfo.day)) === "M"),
+  ).length;
+  if (quota.requiredM < 0) failures.push(`Required M is negative (${quota.requiredM}); selected OFF targets require less than D/E/N core work.`);
+  if (quota.requiredM > theoreticalMCapacity) {
+    failures.push(`Required M ${quota.requiredM} exceeds theoretical available M capacity ${theoreticalMCapacity}.`);
+  }
+  if (quota.requiredM < forcedMDays) failures.push(`Required M ${quota.requiredM} is below ${forcedMDays} explicitly requested M day(s).`);
+  parsed.forEach((input, employeeIndex) => {
+    const target = quota.offTargets[employeeIndex];
+    if (input.fixedOff.size > target) {
+      failures.push(`${EMPLOYEES[employeeIndex]}: OFF target ${target} is below ${input.fixedOff.size} fixedOff/vacation/wantedOff dates.`);
+    }
+    if (target > days.length) failures.push(`${EMPLOYEES[employeeIndex]}: OFF target ${target} exceeds ${days.length} days in month.`);
+    const legalNightDays = nightAvailability.filter((available) => available[employeeIndex]).length;
+    const requestedNightDays = [...input.requests.values()].filter((shift) => normalizeShift(shift) === "N").length;
+    if (quota.nTargets[employeeIndex] > legalNightDays) {
+      failures.push(
+        `${EMPLOYEES[employeeIndex]}: exact N target ${quota.nTargets[employeeIndex]} exceeds ${legalNightDays} statically legal N dates.`,
+      );
+    }
+    if (quota.nTargets[employeeIndex] < requestedNightDays) {
+      failures.push(
+        `${EMPLOYEES[employeeIndex]}: exact N target ${quota.nTargets[employeeIndex]} is below ${requestedNightDays} requested N dates.`,
+      );
+    }
   });
-  const fallbackEmployees = EMPLOYEES.filter((employee, employeeIndex) => {
-    if (parsed[employeeIndex].vacation.size === 0) return false;
-    return result.filter((row) => row[employee] === "/").length === parsed[employeeIndex].minOff + 1;
+  dailyPatterns.forEach(({ patterns, staticFailures }) => {
+    if (patterns.length === 0) failures.push(...staticFailures);
   });
-  return { schedule: result, fallbackEmployees };
+  return failures;
 }
 
 function buildTier1Diagnostics(
@@ -2398,8 +3302,8 @@ function buildTier1Diagnostics(
     `2. Requested N conflicts by exact day: ${requestedNConflicts.length > 0 ? requestedNConflicts.join(" / ") : "none"}.`,
     `3. Required core slots: D/E+N ${selectedSlots}, regular capacity ${selectedCapacity}.`,
     "4. N blocks are derived dynamically; NN is preferred, single N is mildly penalized, and the odd-month NNN exception is heavily penalized.",
-    "5. M service is deferred until after a valid D/E+N core schedule is found.",
-    "6. Preventive generated OFF: skipped before D/E search; final OFF minimum is validated after search.",
+    "5. Exact monthly M quota is assigned inside the integrated day-by-day beam search.",
+    "6. Preventive generated OFF remains disabled; exact OFF/work quotas are pruned throughout beam search.",
     `7. E/M -> D request conflicts: ${emDBlocked.length > 0 ? emDBlocked.join(" / ") : "none"}`,
     `8. Request conflicts: ${requestConflicts.length > 0 ? requestConflicts.join(" / ") : "none"}`,
   ];
@@ -2424,7 +3328,7 @@ export function generateSchedule(
     return { ok: false, days, failures: ["Employee names must be non-empty and unique."] };
   }
   const previousMonthLength = new Date(year, month - 1, 0).getDate();
-  const baseOff = days.filter((day) => day.isRestDay).length;
+  const baseOff = days.filter((day) => day.isWeekend).length;
   const parsed = EMPLOYEES.map((employee) => {
     const input = inputs[employee];
     const parsedInput = parseEmployeeInput(input, days.length) as ParsedWithPrevious;
@@ -2434,56 +3338,115 @@ export function generateSchedule(
     parsedInput.previousMonthSchedule = normalizePreviousMonthSchedule(input, previousMonthLength);
     return parsedInput;
   });
-  const previousFairness = buildPreviousMonthFairness(parsed, previousMonthLength, days.length);
+  const previousMatchedEmployees = EMPLOYEES.filter((_, employeeIndex) => previousTailFor(parsed, employeeIndex).length > 0);
+  const previousUnmatchedEmployees = EMPLOYEES.filter((employee) => !previousMatchedEmployees.includes(employee));
+  const previousMatchDiagnostic = `Previous-month matched employees: ${previousMatchedEmployees.length}/${EMPLOYEES.length}; unmatched current employees: ${previousUnmatchedEmployees.length > 0 ? previousUnmatchedEmployees.join(", ") : "none"}.`;
   const requestFailures = integratedRequestFailures(parsed, days);
   const capacityFailures = dailyHardOffCapacityFailures(days, parsed);
+  const dailyPatterns = days.map((_, dayIndex) => enumerateDailyPatterns(dayIndex, parsed, days));
+  const staticData = buildIntegratedStaticData(days, parsed, dailyPatterns);
   if (requestFailures.length > 0 || capacityFailures.length > 0) {
     return {
       ok: false,
       days,
       failures: [
         "Integrated solver preflight failed.",
+        previousMatchDiagnostic,
         ...requestFailures,
         ...capacityFailures,
       ],
     };
   }
 
-  const tierFailures: string[] = [];
+  const { preferred: preferredQuotas, fallbacksByCount } = buildMonthlyQuotaPlans(days.length, baseOff, parsed);
+  const attemptGroups: { quotas: MonthlyQuotaPlan[]; tier: IntegratedTier }[] = [];
   for (const tier of [1, 2, 3] as IntegratedTier[]) {
-    const solved = integratedBeamSolve(days, parsed, tier, variant, previousFairness);
-    if (solved.ok === false) {
-      tierFailures.push(`Tier ${tier} failed.`, ...solved.failures);
-      continue;
+    attemptGroups.push({ quotas: preferredQuotas, tier });
+  }
+  for (let fallbackCount = 1; fallbackCount <= fallbacksByCount.size; fallbackCount += 1) {
+    const plans = fallbacksByCount.get(fallbackCount) ?? [];
+    for (const tier of [1, 2, 3] as IntegratedTier[]) {
+      attemptGroups.push({ quotas: plans, tier });
     }
+  }
+
+  const tierFailures: string[] = [];
+  const attemptTimingDiagnostics: string[] = [];
+  const reportedPreflightPlans = new Set<string>();
+  for (const { quotas, tier } of attemptGroups) {
+    let selected:
+      | {
+          quota: MonthlyQuotaPlan;
+          tier: IntegratedTier;
+          solved: Extract<IntegratedSolveResult, { ok: true }>;
+          previousFairness: PreviousMonthFairness;
+        }
+      | null = null;
+    for (const quota of quotas) {
+      applyMonthlyQuotaPlan(parsed, quota);
+      const quotaPreflightFailures = monthlyQuotaPreflightFailures(quota, parsed, days, dailyPatterns);
+      if (quotaPreflightFailures.length > 0) {
+        const preflightKey = `${quota.name}|${quota.nTargets.join(",")}`;
+        if (!reportedPreflightPlans.has(preflightKey)) {
+          tierFailures.push(`${quota.name} quota preflight failed.`, ...monthlyQuotaSummary(quota), ...quotaPreflightFailures);
+          reportedPreflightPlans.add(preflightKey);
+        }
+        continue;
+      }
+      const previousFairness = buildPreviousMonthFairness(parsed, previousMonthLength, days.length);
+      const solved = integratedBeamSolve(days, parsed, tier, variant, previousFairness, quota, staticData);
+      attemptTimingDiagnostics.push(solved.performanceDiagnostics[0]);
+      if (solved.ok === false) {
+        const dominantDay = solved.performanceDiagnostics
+          .slice(1)
+          .sort((a, b) => Number(b.match(/; (\d+) ms\.$/)?.[1] ?? 0) - Number(a.match(/; (\d+) ms\.$/)?.[1] ?? 0))[0];
+        tierFailures.push(
+          `${quota.name}, Tier ${tier} failed.`,
+          ...monthlyQuotaSummary(quota),
+          solved.performanceDiagnostics[0],
+          ...(dominantDay ? [`Dominant timing section: ${dominantDay}`] : []),
+          ...solved.failures,
+        );
+        continue;
+      }
+      if (!selected || solved.state.score < selected.solved.state.score) {
+        selected = { quota, tier, solved, previousFairness };
+      }
+    }
+    if (!selected) continue;
+    const { quota, solved, previousFairness } = selected;
+    applyMonthlyQuotaPlan(parsed, quota);
 
     const desiredMDays = days.filter((day) => day.isRestDay).map((day) => day.day);
-    const normalizedVacationOff = reduceVacationOffFallback(solved.schedule, parsed, days, tier);
-    const assignedWeekendM = desiredMDays.filter((day) => currentMCount(normalizedVacationOff.schedule, day - 1) > 0);
-    const removedM = desiredMDays.filter((day) => currentMCount(normalizedVacationOff.schedule, day - 1) === 0);
-    const compensated = addIntegratedWeekdayCompensation(normalizedVacationOff.schedule, parsed, days, tier, removedM.length);
-    const uncompensated = Math.max(0, removedM.length - compensated.assigned);
-    const finalFailures = validateHard(compensated.schedule, parsed, days, integratedRelaxations(tier));
+    const assignedWeekendM = desiredMDays.filter((day) => currentMCount(solved.schedule, day - 1) > 0);
+    const removedM = desiredMDays.filter((day) => currentMCount(solved.schedule, day - 1) === 0);
+    const totalM = solved.schedule.filter((row) => EMPLOYEES.some((employee) => row[employee] === "M")).length;
+    const weekdayM = totalM - assignedWeekendM.length;
+    const finalFailures = validateHard(solved.schedule, parsed, days, integratedRelaxations(tier), quota);
     if (finalFailures.length > 0) {
-      tierFailures.push(`Tier ${tier} post-processing validation failed.`, ...finalFailures);
+      tierFailures.push(`${quota.name}, Tier ${tier} final validation failed.`, ...finalFailures);
       continue;
     }
 
-    const stats = computeStats(compensated.schedule, days);
-    const nightSummary = nightScheduleSummary(compensated.schedule);
-    const fallbackEmployees = EMPLOYEES.filter((employee, employeeIndex) => {
-      if (parsed[employeeIndex].vacation.size === 0) return false;
-      return stats[employeeIndex].off === parsed[employeeIndex].minOff + 1;
-    });
+    const stats = computeStats(solved.schedule, days);
+    const nightSummary = nightScheduleSummary(solved.schedule);
+    const fallbackEmployees = quota.fallbackEmployeeIndexes.map((index) => EMPLOYEES[index]);
     const warnings = [
       ...solved.warnings,
+      ...attemptTimingDiagnostics,
+      ...solved.performanceDiagnostics.slice(1),
+      `OFF plan used: ${quota.name}.`,
       `N schedule: day counts ${EMPLOYEES.map((employee, index) => `${employee}:${nightSummary.dayCounts[index]}`).join(", ")}; block counts ${EMPLOYEES.map((employee, index) => `${employee}:${nightSummary.blockCounts[index]}`).join(", ")}; single N ${nightSummary.singles}; NN ${nightSummary.doubles}; NNN ${nightSummary.triples}; NNN exception ${nightSummary.triples > 0 ? `used (${nightSummary.tripleDetails.join(", ")})` : "not used"}.`,
-      `M service: desired weekend/holiday ${desiredMDays.length}, assigned weekend/holiday ${assignedWeekendM.length}, removed weekend/holiday ${removedM.length}, weekday compensation ${compensated.assigned}, uncompensated ${uncompensated}.`,
-      `Base OFF: ${baseOff}.`,
-      `OFF targets: ${EMPLOYEES.map((employee, index) => `${employee} ${parsed[index].minOff}`).join(", ")}.`,
-      `Actual OFF counts: ${EMPLOYEES.map((employee, index) => `${employee} ${stats[index].off}`).join(", ")}.`,
+      `Weekend base OFF: ${baseOff}.`,
+      `Required total M: ${quota.requiredM}; assigned M: ${totalM}.`,
+      `M prohibited because of vacation dates: ${staticData.vacationDateCount}.`,
+      `OFF targets/actual: ${EMPLOYEES.map((employee, index) => `${employee} ${quota.offTargets[index]}/${stats[index].off}`).join(", ")}.`,
+      `Work targets/actual: ${EMPLOYEES.map((employee, index) => `${employee} ${quota.workTargets[index]}/${stats[index].totalWork}`).join(", ")}.`,
+      `N counts: ${EMPLOYEES.map((employee, index) => `${employee} ${nightSummary.dayCounts[index]}`).join(", ")}.`,
+      `Exact N targets used: ${EMPLOYEES.map((employee, index) => `${employee} ${quota.nTargets[index]}`).join(", ")}.`,
+      `M placement: weekend/holiday ${assignedWeekendM.length}; weekday ${weekdayM}; desired weekend/holiday ${desiredMDays.length}.`,
+      previousMatchDiagnostic,
     ];
-    if (uncompensated > 0) warnings.push(`${uncompensated} removed weekend/holiday M shift(s) could not be compensated on weekdays.`);
     if (fallbackEmployees.length > 0) warnings.push(`Vacation OFF +3 fallback used for: ${fallbackEmployees.join(", ")}.`);
     if (previousFairness.applied) {
       const currentOffAverage = previousFairness.eligible.reduce(
@@ -2508,15 +3471,19 @@ export function generateSchedule(
 
     return {
       ok: true,
-      schedule: compensated.schedule,
+      schedule: solved.schedule,
       days,
       stats,
       balance: computeBalanceStats(stats),
       removedM,
       warnings,
-      score: tier2Score(compensated.schedule, days, parsed),
+      score: tier2Score(solved.schedule, days, parsed),
     };
   }
 
-  return { ok: false, days, failures: ["Integrated day-by-day solver failed in all tiers.", ...tierFailures] };
+  return {
+    ok: false,
+    days,
+    failures: ["Integrated day-by-day solver failed in all tiers.", previousMatchDiagnostic, ...tierFailures],
+  };
 }
