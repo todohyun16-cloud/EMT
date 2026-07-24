@@ -2003,9 +2003,32 @@ type BeamState = {
   score: number;
 };
 
+type SuffixOutcome = "succeeded" | "timed out" | "exhausted" | "not started";
+type SolverAttemptSummary = {
+  planName: string;
+  tier: IntegratedTier;
+  elapsedMs: number;
+  earlyBeamMs: number;
+  suffixMs: number;
+  suffixOutcome: SuffixOutcome;
+  dfsNodes: number;
+  suffixStartingStates: number;
+};
 type IntegratedSolveResult =
-  | { ok: true; state: BeamState; schedule: Schedule; warnings: string[]; performanceDiagnostics: string[] }
-  | { ok: false; failures: string[]; performanceDiagnostics: string[] };
+  | {
+      ok: true;
+      state: BeamState;
+      schedule: Schedule;
+      warnings: string[];
+      performanceDiagnostics: string[];
+      attemptSummary: SolverAttemptSummary;
+    }
+  | {
+      ok: false;
+      failures: string[];
+      performanceDiagnostics: string[];
+      attemptSummary: SolverAttemptSummary;
+    };
 
 type BeamDayMetrics = {
   day: number;
@@ -2787,6 +2810,7 @@ function probeNextDayPatternFeasible(
 
 function forwardCheckCandidate(
   state: BeamState,
+  stateSignature: string,
   currentRow: DailyPatternRow,
   dayIndex: number,
   days: DayInfo[],
@@ -2794,27 +2818,14 @@ function forwardCheckCandidate(
   tier: IntegratedTier,
   quota: MonthlyQuotaPlan,
   staticData: IntegratedStaticData,
+  cacheKeyPrefix: string,
   lookaheadCache: Map<string, LookaheadCacheEntry>,
   metrics: BeamDayMetrics,
 ) {
   if (dayIndex + 1 >= days.length) return { ok: true as const };
   metrics.forwardCheckCalls += 1;
   const nextDayIndex = dayIndex + 1;
-  const cacheKey = [
-    nextDayIndex,
-    `spacing:${tier >= 2 ? 1 : 0}`,
-    `nod:${tier >= 3 ? 1 : 0}`,
-    quota.offTargets.join(","),
-    quota.workTargets.join(","),
-    quota.nMinTargets.join(","),
-    quota.nMaxTargets.join(","),
-    state.remainingOffNeeded.join(","),
-    state.remainingWorkNeeded.join(","),
-    state.remainingNNeeded.join(","),
-    state.remainingMNeeded,
-    beamQuotaSignature(state),
-    staticData.dayConstraintSignatures[nextDayIndex],
-  ].join("|");
+  const cacheKey = `${cacheKeyPrefix}|${stateSignature}`;
   const cached = lookaheadCache.get(cacheKey);
   if (cached) {
     metrics.forwardCheckCacheHits += 1;
@@ -3185,6 +3196,28 @@ function performanceDiagnostics(metrics: SolverPerformanceMetrics, quota: Monthl
   return [header, ...days];
 }
 
+function solverAttemptSummary(
+  metrics: SolverPerformanceMetrics,
+  quota: MonthlyQuotaPlan,
+  tier: IntegratedTier,
+  suffixOutcome: SuffixOutcome,
+): SolverAttemptSummary {
+  return {
+    planName: quota.name,
+    tier,
+    elapsedMs: metrics.elapsedMs,
+    earlyBeamMs: metrics.earlyBeamMs,
+    suffixMs: metrics.exactSuffixMs,
+    suffixOutcome,
+    dfsNodes: metrics.suffixNodesVisited,
+    suffixStartingStates: metrics.suffixStartingStatesAttempted,
+  };
+}
+
+function formatSolverAttempt(summary: SolverAttemptSummary) {
+  return `Solver attempt: plan ${summary.planName}; Tier ${summary.tier}; elapsed ${Math.round(summary.elapsedMs)} ms; early beam ${Math.round(summary.earlyBeamMs)} ms; suffix ${Math.round(summary.suffixMs)} ms; suffix ${summary.suffixOutcome}; DFS nodes ${summary.dfsNodes}; suffix starting states ${summary.suffixStartingStates}.`;
+}
+
 function integratedBeamSolve(
   days: DayInfo[],
   parsed: ParsedEmployeeInput[],
@@ -3215,6 +3248,17 @@ function integratedBeamSolve(
     days: [],
   };
   const lookaheadCache = new Map<string, LookaheadCacheEntry>();
+  const forwardCacheSolvePrefix = [
+    `spacing:${tier >= 2 ? 1 : 0}`,
+    `nod:${tier >= 3 ? 1 : 0}`,
+    quota.offTargets.join(","),
+    quota.workTargets.join(","),
+    quota.nMinTargets.join(","),
+    quota.nMaxTargets.join(","),
+  ].join("|");
+  const forwardCacheDayPrefixes = staticData.dayConstraintSignatures.map(
+    (signature, dayIndex) => `${forwardCacheSolvePrefix}|${dayIndex}|${signature}`,
+  );
   let beam: BeamState[] = [initialBeamState(parsed, quota)];
   let candidateOrder = 0;
   const suffixStartIndex = configuredSuffixStartDay(days.length) - 1;
@@ -3235,7 +3279,14 @@ function integratedBeamSolve(
         }
         if (state.spacingRelaxations > 0) warnings.push(`N spacing relaxations: ${state.spacingRelaxations}.`);
         if (state.nODRelaxations > 0) warnings.push(`N-O-D relaxations: ${state.nODRelaxations}.`);
-        return { ok: true, state, schedule: state.schedule, warnings, performanceDiagnostics: diagnostics };
+        return {
+          ok: true,
+          state,
+          schedule: state.schedule,
+          warnings,
+          performanceDiagnostics: diagnostics,
+          attemptSummary: solverAttemptSummary(metrics, quota, tier, "succeeded"),
+        };
       }
       return {
         ok: false,
@@ -3245,6 +3296,7 @@ function integratedBeamSolve(
             : `Exact suffix search exhausted all retained day-${dayIndex} beam states without a valid completion.`,
         ],
         performanceDiagnostics: diagnostics,
+        attemptSummary: solverAttemptSummary(metrics, quota, tier, suffix.timedOut ? "timed out" : "exhausted"),
       };
     }
     const dayStartedAt = performance.now();
@@ -3340,6 +3392,7 @@ function integratedBeamSolve(
       const candidate = entry.candidates[0];
       const result = forwardCheckCandidate(
         candidate.state,
+        entry.signature,
         candidate.row,
         dayIndex,
         days,
@@ -3347,6 +3400,7 @@ function integratedBeamSolve(
         tier,
         quota,
         staticData,
+        forwardCacheDayPrefixes[dayIndex + 1],
         lookaheadCache,
         dayMetrics,
       );
@@ -3371,6 +3425,7 @@ function integratedBeamSolve(
         ok: false,
         failures: [`Solver diagnostic time budget ${timeBudgetMs} ms exceeded after day ${dayIndex + 1}; no invalid schedule was returned.`],
         performanceDiagnostics: diagnostics,
+        attemptSummary: solverAttemptSummary(metrics, quota, tier, "not started"),
       };
     }
     if (passingBySignature.size === 0) {
@@ -3388,7 +3443,12 @@ function integratedBeamSolve(
         `Direct rejection reasons: ${directReasons.length > 0 ? directReasons.join(" / ") : "none"}.`,
         `Forward-check rejection reasons: ${forwardReasons.length > 0 ? forwardReasons.join(" / ") : "none"}.`,
       ];
-      return { ok: false, failures: firstFailure, performanceDiagnostics: diagnostics };
+      return {
+        ok: false,
+        failures: firstFailure,
+        performanceDiagnostics: diagnostics,
+        attemptSummary: solverAttemptSummary(metrics, quota, tier, "not started"),
+      };
     }
 
     const remainingSlots = beamWidth - selectedPrimary.length;
@@ -3411,6 +3471,7 @@ function integratedBeamSolve(
       ok: false,
       failures: [`Tier ${tier}: beam reached month end but no final schedule passed hard validation.`],
       performanceDiagnostics: performanceDiagnostics(metrics, quota, tier),
+      attemptSummary: solverAttemptSummary(metrics, quota, tier, metrics.suffixTimedOut ? "timed out" : "exhausted"),
     };
   }
   const state = valid[0];
@@ -3430,6 +3491,7 @@ function integratedBeamSolve(
     schedule: state.schedule,
     warnings,
     performanceDiagnostics: performanceDiagnostics(metrics, quota, tier),
+    attemptSummary: solverAttemptSummary(metrics, quota, tier, "succeeded"),
   };
 }
 
@@ -3712,16 +3774,16 @@ export function generateSchedule(
   const attemptGroups: { quotas: MonthlyQuotaPlan[]; tier: IntegratedTier }[] = [];
   for (const tier of [1, 2, 3] as IntegratedTier[]) {
     attemptGroups.push({ quotas: preferredQuotas, tier });
-  }
-  for (let fallbackCount = 1; fallbackCount <= fallbacksByCount.size; fallbackCount += 1) {
-    const plans = fallbacksByCount.get(fallbackCount) ?? [];
-    for (const tier of [1, 2, 3] as IntegratedTier[]) {
+    for (let fallbackCount = 1; fallbackCount <= fallbacksByCount.size; fallbackCount += 1) {
+      const plans = fallbacksByCount.get(fallbackCount) ?? [];
       attemptGroups.push({ quotas: plans, tier });
     }
   }
 
   const tierFailures: string[] = [];
+  const attemptDiagnostics: string[] = [];
   const reportedPreflightPlans = new Set<string>();
+  const allAttemptsStartedAt = performance.now();
   for (const { quotas, tier } of attemptGroups) {
     let selected:
       | {
@@ -3732,9 +3794,22 @@ export function generateSchedule(
         }
       | null = null;
     for (const quota of quotas) {
+      const preflightStartedAt = performance.now();
       applyMonthlyQuotaPlan(parsed, quota);
       const quotaPreflightFailures = monthlyQuotaPreflightFailures(quota, parsed, days, dailyPatterns);
       if (quotaPreflightFailures.length > 0) {
+        attemptDiagnostics.push(
+          formatSolverAttempt({
+            planName: quota.name,
+            tier,
+            elapsedMs: performance.now() - preflightStartedAt,
+            earlyBeamMs: 0,
+            suffixMs: 0,
+            suffixOutcome: "not started",
+            dfsNodes: 0,
+            suffixStartingStates: 0,
+          }),
+        );
         const preflightKey = `${quota.name}|${quota.nTargetMode}|${quota.nMinTargets.join(",")}|${quota.nMaxTargets.join(",")}`;
         if (!reportedPreflightPlans.has(preflightKey)) {
           tierFailures.push(`${quota.name} quota preflight failed.`, ...monthlyQuotaSummary(quota), ...quotaPreflightFailures);
@@ -3744,6 +3819,7 @@ export function generateSchedule(
       }
       const previousFairness = buildPreviousMonthFairness(parsed, previousMonthLength, days.length);
       const solved = integratedBeamSolve(days, parsed, tier, variant, previousFairness, quota, staticData);
+      attemptDiagnostics.push(formatSolverAttempt(solved.attemptSummary));
       if (solved.ok === false) {
         const dominantDay = solved.performanceDiagnostics
           .slice(1)
@@ -3776,7 +3852,11 @@ export function generateSchedule(
     }
 
     const stats = computeStats(solved.schedule, days);
-    const warnings = [solved.performanceDiagnostics[0]];
+    const totalElapsedMs = performance.now() - allAttemptsStartedAt;
+    const warnings = [
+      `Overall solver timing: ${Math.round(totalElapsedMs)} ms across ${attemptDiagnostics.length} attempt(s).`,
+      ...attemptDiagnostics,
+    ];
 
     return {
       ok: true,
@@ -3793,6 +3873,12 @@ export function generateSchedule(
   return {
     ok: false,
     days,
-    failures: ["Integrated day-by-day solver failed in all tiers.", previousMatchDiagnostic, ...tierFailures],
+    failures: [
+      "Integrated day-by-day solver failed in all tiers.",
+      previousMatchDiagnostic,
+      `Overall solver timing: ${Math.round(performance.now() - allAttemptsStartedAt)} ms across ${attemptDiagnostics.length} attempt(s).`,
+      ...attemptDiagnostics,
+      ...tierFailures,
+    ],
   };
 }

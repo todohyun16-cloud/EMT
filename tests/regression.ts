@@ -70,8 +70,8 @@ async function main() {
   assert.deepEqual(augustOff.slice(3), [11, 11]);
   assert(august.schedule.slice(23, 29).every((row) => row.신민아 === "/"));
   assert(august.schedule.slice(23, 29).every((row) => !DEFAULT_EMPLOYEES.some((employee) => row[employee] === "M")));
-  assert.equal(august.warnings.length, 1);
-  assert.match(august.warnings[0], /^Solver timing:/);
+  assert.match(august.warnings[0], /^Overall solver timing:/);
+  assert(august.warnings.slice(1).every((warning) => warning.startsWith("Solver attempt:")));
 
   const educationInputs = withPrevious({}, {
     임세민: { educationDays: "8" },
@@ -96,6 +96,7 @@ async function main() {
       nCounts: augustN,
       requiredAndAssignedM: augustM,
       runtimeMs: Math.round(augustRuntimeMs),
+      attempts: august.warnings.slice(1),
     },
     education: {
       employee: "임세민",
