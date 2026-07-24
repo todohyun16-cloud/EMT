@@ -1,19 +1,32 @@
 import { CalendarDays, Download, Loader2, Play, RefreshCw, RotateCcw } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { exportScheduleXlsx } from "@/lib/excel";
 import { buildDays } from "@/lib/holidays";
-import { parseDays } from "@/lib/input";
+import { deserializeRosterInputState, parseDays, serializeRosterInputState } from "@/lib/input";
 import { parsePreviousScheduleXlsx } from "@/lib/previousSchedule";
 import { generateSchedule } from "@/lib/scheduler";
 import { DEFAULT_EMPLOYEES, type Employee, type EmployeeInput, type ScheduleResult } from "@/lib/types";
 import styles from "./styles/App.module.css";
 
 const now = new Date();
-const emptyEmployeeInput: EmployeeInput = { wantedOff: "", vacation: "", requests: "" };
+const emptyEmployeeInput: EmployeeInput = { wantedOff: "", vacation: "", educationDays: "", requests: "" };
+const INPUT_STORAGE_KEY = "emt-roster-employee-inputs";
 const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"];
 
-function defaultInputs() {
-  return DEFAULT_EMPLOYEES.map(() => ({ ...emptyEmployeeInput }));
+function defaultInputs(employeeCount = DEFAULT_EMPLOYEES.length) {
+  return Array.from({ length: employeeCount }, () => ({ ...emptyEmployeeInput }));
+}
+
+function savedInputState() {
+  try {
+    const saved = window.localStorage.getItem(INPUT_STORAGE_KEY);
+    if (!saved) {
+      return { employeeNames: [...DEFAULT_EMPLOYEES], inputs: defaultInputs() };
+    }
+    return deserializeRosterInputState(saved, DEFAULT_EMPLOYEES);
+  } catch {
+    return { employeeNames: [...DEFAULT_EMPLOYEES], inputs: defaultInputs() };
+  }
 }
 
 function shiftClass(code: string) {
@@ -24,10 +37,11 @@ function shiftClass(code: string) {
 }
 
 export default function App() {
+  const [initialInputState] = useState(savedInputState);
   const [year, setYear] = useState(now.getFullYear());
   const [month, setMonth] = useState(now.getMonth() + 1);
-  const [employeeNames, setEmployeeNames] = useState<string[]>([...DEFAULT_EMPLOYEES]);
-  const [inputs, setInputs] = useState<EmployeeInput[]>(defaultInputs);
+  const [employeeNames, setEmployeeNames] = useState<string[]>(initialInputState.employeeNames);
+  const [inputs, setInputs] = useState<EmployeeInput[]>(initialInputState.inputs);
   const [manualHolidays, setManualHolidays] = useState("");
   const [template, setTemplate] = useState<File | null>(null);
   const [result, setResult] = useState<ScheduleResult | null>(null);
@@ -37,7 +51,15 @@ export default function App() {
 
   const maxDay = useMemo(() => new Date(year, month, 0).getDate(), [year, month]);
 
-  const updateEmployee = (employeeIndex: number, field: keyof EmployeeInput, value: string) => {
+  useEffect(() => {
+    window.localStorage.setItem(INPUT_STORAGE_KEY, serializeRosterInputState(employeeNames, inputs));
+  }, [employeeNames, inputs]);
+
+  const updateEmployee = (
+    employeeIndex: number,
+    field: "wantedOff" | "vacation" | "educationDays" | "requests",
+    value: string,
+  ) => {
     setInputs((current) => current.map((input, index) => (index === employeeIndex ? { ...input, [field]: value } : input)));
   };
 
@@ -60,14 +82,21 @@ export default function App() {
         try {
           const previousMonthLength = new Date(year, month - 1, 0).getDate();
           let previousSchedules: Partial<Record<Employee, (string | null)[]>> = {};
+          let unmatchedPreviousEmployees: Employee[] = [];
           if (template) {
             try {
-              previousSchedules = await parsePreviousScheduleXlsx(template, previousMonthLength, activeEmployees);
-            } catch {
+              const imported = await parsePreviousScheduleXlsx(template, previousMonthLength, activeEmployees);
+              previousSchedules = imported.schedules;
+              unmatchedPreviousEmployees = imported.unmatchedEmployees;
+            } catch (error) {
               setResult({
                 ok: false,
                 days: buildDays(year, month, holidays),
-                failures: ["Failed to read previous-month Excel schedule. Please check employee names and date headers."],
+                failures: [
+                  error instanceof Error
+                    ? error.message
+                    : "Failed to read previous-month Excel schedule. Please check employee names and date headers.",
+                ],
               });
               return;
             }
@@ -85,14 +114,13 @@ export default function App() {
 
           const next = generateSchedule(year, month, inputsWithPrevious, holidays, variant, activeEmployees);
           if (next.ok && template) {
-            const loadedCount = activeEmployees.filter((employee) => previousSchedules[employee]?.length).length;
-            const unmatched = activeEmployees.filter((employee) => !previousSchedules[employee]?.length);
             setResult({
               ...next,
               warnings: [
                 ...next.warnings,
-                `Previous-month schedule loaded for ${loadedCount} of ${activeEmployees.length} employees.`,
-                ...(unmatched.length > 0 ? [`No previous-month match for: ${unmatched.join(", ")}.`] : []),
+                ...(unmatchedPreviousEmployees.length > 0
+                  ? [`No previous-month exact name match for: ${unmatchedPreviousEmployees.join(", ")}.`]
+                  : []),
               ],
             });
           } else {
@@ -196,6 +224,10 @@ export default function App() {
               <label>
                 휴가
                 <input value={inputs[employeeIndex].vacation} onChange={(event) => updateEmployee(employeeIndex, "vacation", event.target.value)} placeholder="12,13,14,15,16,17" />
+              </label>
+              <label>
+                교육일
+                <input value={inputs[employeeIndex].educationDays ?? ""} onChange={(event) => updateEmployee(employeeIndex, "educationDays", event.target.value)} placeholder="8,22" />
               </label>
               <label>
                 희망근무

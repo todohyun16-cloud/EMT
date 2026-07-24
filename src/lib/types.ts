@@ -1,4 +1,4 @@
-export const DEFAULT_EMPLOYEES = ["정채현", "조한승", "이우석", "신민아", "박대성"] as const;
+export const DEFAULT_EMPLOYEES = ["조한승", "이우석", "신민아", "박대성", "임세민"] as const;
 export type Employee = string;
 export let EMPLOYEES: Employee[] = [...DEFAULT_EMPLOYEES];
 
@@ -11,6 +11,7 @@ export type WorkShift = Exclude<ShiftCode, "/">;
 export type EmployeeInput = {
   wantedOff: string;
   vacation: string;
+  educationDays?: string;
   requests: string;
   previousMonthSchedule?: (string | null)[];
 };
@@ -18,8 +19,10 @@ export type EmployeeInput = {
 export type ParsedEmployeeInput = {
   wantedOff: Set<number>;
   vacation: Set<number>;
+  educationDays: Set<number>;
   fixedOff: Set<number>;
   requests: Map<number, WorkShift>;
+  requestFailures: string[];
   minOff: number;
   targetOff: number;
 };

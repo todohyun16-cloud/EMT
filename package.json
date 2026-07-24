@@ -6,7 +6,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test:unit": "tsx --test tests/unit.test.ts",
+    "test:regression": "tsx tests/regression.ts"
   },
   "dependencies": {
     "exceljs": "^4.4.0",
@@ -21,6 +23,7 @@
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^6.0.2",
     "eslint": "^9",
+    "tsx": "^4.23.1",
     "typescript": "^5",
     "vite": "^8.0.13"
   }
