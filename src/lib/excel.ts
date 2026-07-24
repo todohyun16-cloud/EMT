@@ -2,110 +2,103 @@ import type { DayInfo, Employee, EmployeeStats, Schedule } from "./types";
 
 type ExcelJSModule = typeof import("exceljs");
 
-function cellDay(value: unknown): number | null {
-  if (typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 31) return value;
-  if (value instanceof Date) return value.getDate();
-  if (typeof value === "string") {
-    const match = value.match(/^(\d{1,2})(일)?$/);
-    if (match) return Number(match[1]);
-  }
-  return null;
-}
+export type ScheduleWorkbookArgs = {
+  year: number;
+  month: number;
+  days: DayInfo[];
+  schedule: Schedule;
+  stats: EmployeeStats[];
+  employees: Employee[];
+};
 
-function findEmployeeRows(worksheet: import("exceljs").Worksheet, employees: readonly Employee[]) {
-  const rows = new Map<Employee, number>();
-  worksheet.eachRow((row, rowNumber) => {
-    row.eachCell((cell) => {
-      const text = String(cell.value ?? "").trim();
-      if (employees.includes(text)) rows.set(text, rowNumber);
-    });
-  });
-  return rows;
-}
+const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"];
+const SCHEDULE_HEADER_ROWS = 4;
 
-function findDateColumns(worksheet: import("exceljs").Worksheet, days: DayInfo[]) {
-  let bestRow = 1;
-  let bestMatches = new Map<number, number>();
-  worksheet.eachRow((row, rowNumber) => {
-    const matches = new Map<number, number>();
-    row.eachCell((cell, colNumber) => {
-      const day = cellDay(cell.value);
-      if (day && day <= days.length) matches.set(day, colNumber);
-    });
-    if (matches.size > bestMatches.size) {
-      bestMatches = matches;
-      bestRow = rowNumber;
-    }
-  });
-  return { headerRow: bestRow, columns: bestMatches };
+async function loadExcelJS() {
+  const imported = await import("exceljs");
+  return ((imported as ExcelJSModule & { default?: ExcelJSModule }).default ?? imported) as ExcelJSModule;
 }
 
 function dayColor(day: DayInfo) {
   if (day.isSunday || day.isHoliday) return "FFFF0000";
   if (day.isSaturday) return "FF0000FF";
-  return "FF666666";
+  return "FF444444";
 }
 
-function colorDayCells(worksheet: import("exceljs").Worksheet, rowNumbers: number[], column: number, day: DayInfo) {
-  rowNumbers.forEach((row) => {
-    const cell = worksheet.getCell(row, column);
-    cell.font = { ...cell.font, color: { argb: dayColor(day) } };
-  });
-}
-
-function ensureSheetLayout(
+function addScheduleSheet(
   workbook: import("exceljs").Workbook,
-  year: number,
-  month: number,
-  days: DayInfo[],
-  employees: readonly Employee[],
+  args: ScheduleWorkbookArgs,
 ) {
-  let worksheet = workbook.worksheets[0] ?? workbook.addWorksheet(`${month}월 당직표`);
-  const foundRows = findEmployeeRows(worksheet, employees);
-  const foundColumns = findDateColumns(worksheet, days);
-  const hasLayout = foundRows.size === employees.length && foundColumns.columns.size === days.length;
-  if (hasLayout) {
-    worksheet.name = `${month}월 당직표`;
-    worksheet.getCell(1, 1).value = `${year}년 ${month}월 응급구조사 당직표`;
-    days.forEach((day) => {
-      const column = foundColumns.columns.get(day.day);
-      if (column) colorDayCells(worksheet, [foundColumns.headerRow, foundColumns.headerRow + 1, foundColumns.headerRow + 2], column, day);
-    });
-    return { worksheet, employeeRows: foundRows, dateColumns: foundColumns.columns };
-  }
+  const sheet = workbook.addWorksheet(`${args.month}월 당직표`, {
+    views: [{ state: "frozen", xSplit: 1, ySplit: SCHEDULE_HEADER_ROWS }],
+  });
+  const lastColumn = args.days.length + 1;
+  sheet.mergeCells(1, 1, 1, lastColumn);
+  const title = sheet.getCell(1, 1);
+  title.value = `${args.year}년 ${args.month}월 응급구조사 당직표`;
+  title.font = { bold: true, color: { argb: "FFFFFFFF" }, size: 16 };
+  title.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F4E78" } };
+  title.alignment = { horizontal: "center", vertical: "middle" };
+  sheet.getRow(1).height = 28;
 
-  if (workbook.worksheets.includes(worksheet)) workbook.removeWorksheet(worksheet.id);
-  worksheet = workbook.addWorksheet(`${month}월 당직표`);
-  const sheet = worksheet;
-  sheet.getCell(1, 1).value = `${year}년 ${month}월 응급구조사 당직표`;
   sheet.getCell(2, 1).value = "직원";
   sheet.getCell(3, 1).value = "요일";
   sheet.getCell(4, 1).value = "구분";
-  days.forEach((day, index) => {
+  for (let row = 2; row <= 4; row += 1) {
+    const cell = sheet.getCell(row, 1);
+    cell.font = { bold: true, color: { argb: "FF1F1F1F" } };
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEAF2F8" } };
+    cell.alignment = { horizontal: "center", vertical: "middle" };
+  }
+  sheet.getColumn(1).width = 12;
+
+  args.days.forEach((day, index) => {
     const column = index + 2;
-    sheet.getCell(2, column).value = day.day;
-    sheet.getCell(3, column).value = ["일", "월", "화", "수", "목", "금", "토"][day.weekday];
-    sheet.getCell(4, column).value = day.holidayName ?? (day.isWeekend ? "주말" : "평일");
-    colorDayCells(sheet, [2, 3, 4], column, day);
+    const cells = [sheet.getCell(2, column), sheet.getCell(3, column), sheet.getCell(4, column)];
+    cells[0].value = day.day;
+    cells[1].value = WEEKDAYS[day.weekday];
+    cells[2].value = day.holidayName ?? (day.isWeekend ? "주말" : "평일");
+    cells.forEach((cell) => {
+      cell.font = { bold: true, color: { argb: dayColor(day) } };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEAF2F8" } };
+      cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+    });
     sheet.getColumn(column).width = 5;
   });
-  sheet.getColumn(1).width = 12;
-  const employeeRows = new Map<Employee, number>();
-  employees.forEach((employee, index) => {
-    const rowNumber = index + 5;
-    employeeRows.set(employee, rowNumber);
-    sheet.getCell(rowNumber, 1).value = employee;
+  sheet.getRow(4).height = 28;
+
+  args.employees.forEach((employee, employeeIndex) => {
+    const rowNumber = employeeIndex + SCHEDULE_HEADER_ROWS + 1;
+    const nameCell = sheet.getCell(rowNumber, 1);
+    nameCell.value = employee;
+    nameCell.font = { bold: true };
+    nameCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD9EAF7" } };
+    nameCell.alignment = { horizontal: "center", vertical: "middle" };
+
+    args.days.forEach((_, dayIndex) => {
+      const shift = args.schedule[dayIndex][employee];
+      const cell = sheet.getCell(rowNumber, dayIndex + 2);
+      cell.value = shift === "/" ? "O" : shift;
+      cell.alignment = { horizontal: "center", vertical: "middle" };
+    });
   });
-  const dateColumns = new Map(days.map((day, index) => [day.day, index + 2]));
-  return { worksheet: sheet, employeeRows, dateColumns };
+
+  return sheet;
 }
 
-function addStatsSheet(workbook: import("exceljs").Workbook, stats: EmployeeStats[]) {
-  const oldSheet = workbook.getWorksheet("개인별 통계");
-  if (oldSheet) workbook.removeWorksheet(oldSheet.id);
-  const sheet = workbook.addWorksheet("개인별 통계");
+function addStatsSheet(
+  workbook: import("exceljs").Workbook,
+  employees: readonly Employee[],
+  stats: EmployeeStats[],
+) {
+  const sheet = workbook.addWorksheet("개인별 통계", {
+    views: [{ state: "frozen", ySplit: 1 }],
+  });
   sheet.addRow(["직원", "D", "E/M", "N", "OFF", "토", "일", "공휴일", "주말2오프", "총근무"]);
-  stats.forEach((item) => {
+  const statsByEmployee = new Map(stats.map((item) => [item.employee, item]));
+  employees.forEach((employee) => {
+    const item = statsByEmployee.get(employee);
+    if (!item) return;
     sheet.addRow([
       item.employee,
       item.D,
@@ -119,40 +112,24 @@ function addStatsSheet(workbook: import("exceljs").Workbook, stats: EmployeeStat
       item.totalWork,
     ]);
   });
+  sheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
+  sheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F4E78" } };
+  sheet.getRow(1).alignment = { horizontal: "center", vertical: "middle" };
   sheet.columns.forEach((column) => {
     column.width = 12;
   });
 }
 
-export async function exportScheduleXlsx(args: {
-  year: number;
-  month: number;
-  days: DayInfo[];
-  schedule: Schedule;
-  stats: EmployeeStats[];
-  employees: Employee[];
-  template?: File | null;
-}) {
-  const ExcelJS = (await import("exceljs")) as ExcelJSModule;
+export async function buildScheduleWorkbook(args: ScheduleWorkbookArgs) {
+  const ExcelJS = await loadExcelJS();
   const workbook = new ExcelJS.Workbook();
+  addScheduleSheet(workbook, args);
+  addStatsSheet(workbook, args.employees, args.stats);
+  return workbook;
+}
 
-  if (args.template) {
-    const buffer = await args.template.arrayBuffer();
-    await workbook.xlsx.load(buffer);
-  }
-
-  const { worksheet, employeeRows, dateColumns } = ensureSheetLayout(workbook, args.year, args.month, args.days, args.employees);
-  args.days.forEach((day, dayIndex) => {
-    const col = dateColumns.get(day.day);
-    if (!col) return;
-    args.employees.forEach((employee) => {
-      const row = employeeRows.get(employee);
-      if (!row) return;
-      worksheet.getCell(row, col).value = args.schedule[dayIndex][employee];
-    });
-  });
-
-  addStatsSheet(workbook, args.stats);
+export async function exportScheduleXlsx(args: ScheduleWorkbookArgs) {
+  const workbook = await buildScheduleWorkbook(args);
   const bytes = await workbook.xlsx.writeBuffer();
   const blob = new Blob([bytes], {
     type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

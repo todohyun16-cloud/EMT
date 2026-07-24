@@ -163,7 +163,6 @@ export default function App() {
         schedule: result.schedule,
         stats: result.stats,
         employees: result.stats.map((stat) => stat.employee),
-        template,
       });
     } finally {
       setIsExporting(false);
