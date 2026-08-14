@@ -1,5 +1,4 @@
-﻿import { buildDays } from "./holidays";
-import { parseEmployeeInput } from "./input";
+﻿import { parseEmployeeInput } from "./input";
 import { normalizePreviousMonthShift } from "./previousSchedule";
 import {
   EMPLOYEES,
@@ -52,8 +51,8 @@ export function baseOffCount(days: DayInfo[]) {
   return days.filter((day) => day.isRestDay).length;
 }
 
-export function monthlyOffTarget(baseOff: number, input: ParsedEmployeeInput, vacationFallback = false) {
-  return baseOff + input.educationDays.size + (input.vacation.size > 0 ? 2 + (vacationFallback ? 1 : 0) : 0);
+export function monthlyOffTarget(baseOff: number, input: ParsedEmployeeInput) {
+  return baseOff + input.vacation.size + input.educationDays.size;
 }
 
 function seededNoise(seed: number, ...values: number[]) {
@@ -1965,7 +1964,6 @@ type MonthlyQuotaPlan = {
   nMinTargets: number[];
   nMaxTargets: number[];
   nTargetMode: "unified" | "legacy";
-  fallbackEmployeeIndexes: number[];
 };
 type BeamHistory = {
   row: Record<Employee, ShiftCode>;
@@ -3550,14 +3548,10 @@ function buildMonthlyQuotaPlan(
   daysInMonth: number,
   baseOff: number,
   parsed: ParsedEmployeeInput[],
-  fallbackEmployeeIndexes: number[],
   nTargets: number[],
   nTargetMode: "unified" | "legacy",
 ): MonthlyQuotaPlan {
-  const fallbackSet = new Set(fallbackEmployeeIndexes);
-  const offTargets = parsed.map(
-    (input, employeeIndex) => monthlyOffTarget(baseOff, input, fallbackSet.has(employeeIndex)),
-  );
+  const offTargets = parsed.map((input) => monthlyOffTarget(baseOff, input));
   const workTargets = offTargets.map((target) => daysInMonth - target);
   const requiredTotalWork = workTargets.reduce((sum, target) => sum + target, 0);
   const requiredCoreWork = daysInMonth * 3;
@@ -3565,10 +3559,7 @@ function buildMonthlyQuotaPlan(
   const nRemainder = daysInMonth % EMPLOYEES.length;
   const nCeilTarget = nFloorTarget + (nRemainder > 0 ? 1 : 0);
   return {
-    name:
-      fallbackEmployeeIndexes.length === 0
-        ? "Plan A (vacation OFF +2)"
-        : `Vacation OFF +3 plan (${fallbackEmployeeIndexes.map((index) => EMPLOYEES[index]).join(", ")})`,
+    name: "Exact vacation-day OFF plan",
     baseOff,
     offTargets,
     workTargets,
@@ -3580,7 +3571,6 @@ function buildMonthlyQuotaPlan(
     nMinTargets: nTargetMode === "unified" ? EMPLOYEES.map(() => nFloorTarget) : [...nTargets],
     nMaxTargets: nTargetMode === "unified" ? EMPLOYEES.map(() => nCeilTarget) : [...nTargets],
     nTargetMode,
-    fallbackEmployeeIndexes,
   };
 }
 
@@ -3616,20 +3606,7 @@ function buildMonthlyQuotaPlans(daysInMonth: number, baseOff: number, parsed: Pa
   const targetPlans = legacyMode
     ? exactNightTargetVectors(daysInMonth).map((nTargets) => ({ nTargets, mode: "legacy" as const }))
     : [{ nTargets: EMPLOYEES.map(() => Math.ceil(daysInMonth / EMPLOYEES.length)), mode: "unified" as const }];
-  const preferred = targetPlans.map(({ nTargets, mode }) => buildMonthlyQuotaPlan(daysInMonth, baseOff, parsed, [], nTargets, mode));
-  const vacationIndexes = parsed
-    .map((input, employeeIndex) => (input.vacation.size > 0 ? employeeIndex : -1))
-    .filter((employeeIndex) => employeeIndex >= 0);
-  const fallbacksByCount = new Map<number, MonthlyQuotaPlan[]>();
-  for (let count = 1; count <= vacationIndexes.length; count += 1) {
-    fallbacksByCount.set(
-      count,
-      employeeIndexCombinations(vacationIndexes, count).flatMap((indexes) =>
-        targetPlans.map(({ nTargets, mode }) => buildMonthlyQuotaPlan(daysInMonth, baseOff, parsed, indexes, nTargets, mode)),
-      ),
-    );
-  }
-  return { preferred, fallbacksByCount };
+  return targetPlans.map(({ nTargets, mode }) => buildMonthlyQuotaPlan(daysInMonth, baseOff, parsed, nTargets, mode));
 }
 
 function applyMonthlyQuotaPlan(parsed: ParsedEmployeeInput[], quota: MonthlyQuotaPlan) {
@@ -3724,13 +3701,19 @@ export function generateSchedule(
   year: number,
   month: number,
   inputs: Record<Employee, EmployeeInput>,
-  manualHolidayDays: Set<number>,
+  days: DayInfo[],
   variant = 0,
   activeEmployees: readonly Employee[] = Object.keys(inputs),
 ): ScheduleResult {
   const normalizedEmployees = activeEmployees.map((employee) => employee.trim());
   setActiveEmployees(normalizedEmployees);
-  const days = buildDays(year, month, manualHolidayDays);
+  const expectedDays = new Date(year, month, 0).getDate();
+  if (
+    days.length !== expectedDays ||
+    days.some((day, index) => day.day !== index + 1 || day.date.getFullYear() !== year || day.date.getMonth() !== month - 1)
+  ) {
+    return { ok: false, days, failures: ["Official holiday calendar does not match the selected year and month."] };
+  }
   if (
     normalizedEmployees.length === 0 ||
     normalizedEmployees.some((employee) => employee.length === 0) ||
@@ -3770,14 +3753,10 @@ export function generateSchedule(
     };
   }
 
-  const { preferred: preferredQuotas, fallbacksByCount } = buildMonthlyQuotaPlans(days.length, baseOff, parsed);
+  const quotas = buildMonthlyQuotaPlans(days.length, baseOff, parsed);
   const attemptGroups: { quotas: MonthlyQuotaPlan[]; tier: IntegratedTier }[] = [];
   for (const tier of [1, 2, 3] as IntegratedTier[]) {
-    attemptGroups.push({ quotas: preferredQuotas, tier });
-    for (let fallbackCount = 1; fallbackCount <= fallbacksByCount.size; fallbackCount += 1) {
-      const plans = fallbacksByCount.get(fallbackCount) ?? [];
-      attemptGroups.push({ quotas: plans, tier });
-    }
+    attemptGroups.push({ quotas, tier });
   }
 
   const tierFailures: string[] = [];

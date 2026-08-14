@@ -1,7 +1,7 @@
 import { CalendarDays, Download, Loader2, Play, RefreshCw, RotateCcw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { exportScheduleXlsx } from "@/lib/excel";
-import { buildDays } from "@/lib/holidays";
+import { buildDays, fetchOfficialHolidays } from "@/lib/holidays";
 import { deserializeRosterInputState, parseDays, serializeRosterInputState } from "@/lib/input";
 import { parsePreviousScheduleXlsx } from "@/lib/previousSchedule";
 import { generateSchedule } from "@/lib/scheduler";
@@ -68,11 +68,12 @@ export default function App() {
     window.setTimeout(() => {
       void (async () => {
         const holidays = parseDays(manualHolidays, maxDay);
+        let days = buildDays(year, month, [], holidays);
         const activeEmployees = employeeNames.map((name) => name.trim());
         if (activeEmployees.some((name) => name.length === 0) || new Set(activeEmployees).size !== activeEmployees.length) {
           setResult({
             ok: false,
-            days: buildDays(year, month, holidays),
+            days,
             failures: ["Employee names must be non-empty and unique."],
           });
           setIsGenerating(false);
@@ -80,6 +81,8 @@ export default function App() {
         }
 
         try {
+          const officialHolidays = await fetchOfficialHolidays(year, month);
+          days = buildDays(year, month, officialHolidays, holidays);
           const previousMonthLength = new Date(year, month - 1, 0).getDate();
           let previousSchedules: Partial<Record<Employee, (string | null)[]>> = {};
           let unmatchedPreviousEmployees: Employee[] = [];
@@ -91,7 +94,7 @@ export default function App() {
             } catch (error) {
               setResult({
                 ok: false,
-                days: buildDays(year, month, holidays),
+                days,
                 failures: [
                   error instanceof Error
                     ? error.message
@@ -112,7 +115,7 @@ export default function App() {
             ]),
           ) as Record<Employee, EmployeeInput>;
 
-          const next = generateSchedule(year, month, inputsWithPrevious, holidays, variant, activeEmployees);
+          const next = generateSchedule(year, month, inputsWithPrevious, days, variant, activeEmployees);
           if (next.ok && template) {
             setResult({
               ...next,
@@ -126,6 +129,16 @@ export default function App() {
           } else {
             setResult(next);
           }
+        } catch (error) {
+          setResult({
+            ok: false,
+            days,
+            failures: [
+              error instanceof Error
+                ? error.message
+                : "Unable to load official holidays. Schedule generation was stopped.",
+            ],
+          });
         } finally {
           setIsGenerating(false);
         }

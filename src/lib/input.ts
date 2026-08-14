@@ -66,8 +66,7 @@ export function parseEmployeeInput(input: EmployeeInput, maxDay: number): Parsed
   const educationDays = parseDays(input.educationDays ?? "", maxDay);
   const parsedRequests = parseRequestsStrict(input.requests, maxDay);
   const fixedOff = new Set([...wantedOff, ...vacation, ...educationDays, ...parsedRequests.requestedOff]);
-  const vacationOffBonus = vacation.size >= 6 ? 3 : vacation.size;
-  const minOff = 8 + vacationOffBonus + educationDays.size;
+  const minOff = 8 + vacation.size + educationDays.size;
 
   return {
     wantedOff,

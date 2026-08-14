@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { parsePreviousScheduleXlsx } from "../src/lib/previousSchedule";
+import { buildDays, type OfficialHoliday } from "../src/lib/holidays";
 import { baseOffCount, generateSchedule } from "../src/lib/scheduler";
 import { DEFAULT_EMPLOYEES, type EmployeeInput } from "../src/lib/types";
 
@@ -14,6 +15,11 @@ const emptyInput = (): EmployeeInput => ({
   educationDays: "",
   requests: "",
 });
+
+const AUGUST_2026_HOLIDAYS: OfficialHoliday[] = [
+  { date: "2026-08-15", name: "광복절" },
+  { date: "2026-08-17", name: "광복절 대체공휴일" },
+];
 
 async function importFixture() {
   const bytes = await readFile(fixturePath);
@@ -55,7 +61,8 @@ async function main() {
     },
   });
   const augustStarted = performance.now();
-  const august = generateSchedule(2026, 8, augustInputs, new Set(), 0, DEFAULT_EMPLOYEES);
+  const augustDays = buildDays(2026, 8, AUGUST_2026_HOLIDAYS);
+  const august = generateSchedule(2026, 8, augustInputs, augustDays, 0, DEFAULT_EMPLOYEES);
   const augustRuntimeMs = performance.now() - augustStarted;
   assert.equal(august.ok, true, august.ok ? undefined : august.failures.slice(0, 20).join("\n"));
 
@@ -66,7 +73,7 @@ async function main() {
   const augustM = august.schedule.filter((row) => DEFAULT_EMPLOYEES.some((employee) => row[employee] === "M")).length;
   assert.equal(baseOffCount(august.days), 11);
   assert.deepEqual(augustOff.slice(0, 2), [11, 11]);
-  assert.equal(augustOff[2] === 13 || augustOff[2] === 14, true);
+  assert.equal(augustOff[2], 17);
   assert.deepEqual(augustOff.slice(3), [11, 11]);
   assert(august.schedule.slice(23, 29).every((row) => row.신민아 === "/"));
   assert(august.schedule.slice(23, 29).every((row) => !DEFAULT_EMPLOYEES.some((employee) => row[employee] === "M")));
@@ -77,7 +84,12 @@ async function main() {
     임세민: { educationDays: "8" },
   });
   const educationStarted = performance.now();
-  const education = generateSchedule(2026, 2, educationInputs, new Set(), 0, DEFAULT_EMPLOYEES);
+  const educationDays = buildDays(2026, 2, [
+    { date: "2026-02-16", name: "설날 전날" },
+    { date: "2026-02-17", name: "설날" },
+    { date: "2026-02-18", name: "설날 다음날" },
+  ]);
+  const education = generateSchedule(2026, 2, educationInputs, educationDays, 0, DEFAULT_EMPLOYEES);
   const educationRuntimeMs = performance.now() - educationStarted;
   assert.equal(education.ok, true, education.ok ? undefined : education.failures.slice(0, 20).join("\n"));
   if (!education.ok) throw new Error("Education schedule regression failed.");

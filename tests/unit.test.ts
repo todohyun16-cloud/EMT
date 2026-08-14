@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import ExcelJS from "exceljs";
 import { buildScheduleWorkbook } from "../src/lib/excel";
-import { buildDays } from "../src/lib/holidays";
+import {
+  buildDays,
+  fetchOfficialHolidays,
+  parseOfficialHolidayApiXml,
+  type OfficialHoliday,
+} from "../src/lib/holidays";
 import {
   deserializeEmployeeInputs,
   deserializeRosterInputState,
@@ -34,6 +39,25 @@ const emptyInput = (): EmployeeInput => ({
   educationDays: "",
   requests: "",
 });
+
+const AUGUST_2026_HOLIDAYS: OfficialHoliday[] = [
+  { date: "2026-08-15", name: "광복절" },
+  { date: "2026-08-17", name: "광복절 대체공휴일" },
+];
+const SEPTEMBER_2026_HOLIDAYS: OfficialHoliday[] = [
+  { date: "2026-09-24", name: "추석 전날" },
+  { date: "2026-09-25", name: "추석" },
+  { date: "2026-09-26", name: "추석 다음날" },
+];
+
+function calendar(
+  year: number,
+  month: number,
+  officialHolidays: readonly OfficialHoliday[] = [],
+  manualHolidayDays: Set<number> = new Set(),
+) {
+  return buildDays(year, month, officialHolidays, manualHolidayDays);
+}
 
 function inputs(overrides: Partial<Record<(typeof DEFAULT_EMPLOYEES)[number], Partial<EmployeeInput>>> = {}) {
   return Object.fromEntries(
@@ -70,12 +94,61 @@ function syntheticPreviousWorksheet(options: {
   return sheet;
 }
 
-test("base OFF counts weekday holidays and counts weekend overlap once", () => {
-  const august = buildDays(2026, 8, new Set());
+test("official and manual holidays produce deduplicated base OFF dates", () => {
+  const august = calendar(2026, 8, AUGUST_2026_HOLIDAYS);
   assert.equal(august.filter((day) => day.isWeekend).length, 10);
   assert.equal(baseOffCount(august), 11);
-  assert.equal(baseOffCount(buildDays(2026, 8, new Set([1]))), 11);
-  assert.equal(baseOffCount(buildDays(2026, 8, new Set([3]))), 12);
+  assert.equal(baseOffCount(calendar(2026, 8, AUGUST_2026_HOLIDAYS, new Set([15]))), 11);
+  assert.equal(baseOffCount(calendar(2026, 8, AUGUST_2026_HOLIDAYS, new Set([17]))), 11);
+  assert.equal(baseOffCount(calendar(2026, 8, AUGUST_2026_HOLIDAYS, new Set([3]))), 12);
+});
+
+test("September 2026 uses only official Chuseok dates and exact vacation-day OFF bonuses", () => {
+  const september = calendar(2026, 9, SEPTEMBER_2026_HOLIDAYS);
+  assert.deepEqual(
+    september.filter((day) => day.isHoliday).map((day) => day.day),
+    [24, 25, 26],
+  );
+  assert.equal(september[27].isHoliday, false);
+  assert.equal(baseOffCount(september), 10);
+
+  const none = parseEmployeeInput(emptyInput(), 30);
+  const oneVacation = parseEmployeeInput({ ...emptyInput(), vacation: "10" }, 30);
+  const twoVacations = parseEmployeeInput({ ...emptyInput(), vacation: "10,11" }, 30);
+  const vacationAndEducation = parseEmployeeInput({ ...emptyInput(), vacation: "10", educationDays: "11" }, 30);
+  assert.deepEqual(
+    [none, oneVacation, twoVacations, vacationAndEducation].map((input) => {
+      const off = monthlyOffTarget(10, input);
+      return { off, work: 30 - off };
+    }),
+    [
+      { off: 10, work: 20 },
+      { off: 11, work: 19 },
+      { off: 12, work: 18 },
+      { off: 12, work: 18 },
+    ],
+  );
+});
+
+test("official API payload preserves real substitute holidays and client failures are explicit", async () => {
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+    <response><header><resultCode>00</resultCode><resultMsg>NORMAL SERVICE.</resultMsg></header><body><items>
+      <item><dateName>삼일절</dateName><locdate>20260301</locdate></item>
+      <item><dateName>삼일절 대체공휴일</dateName><locdate>20260302</locdate></item>
+    </items></body></response>`;
+  const holidays = parseOfficialHolidayApiXml(xml, 2026, 3);
+  assert.deepEqual(holidays, [
+    { date: "2026-03-01", name: "삼일절" },
+    { date: "2026-03-02", name: "삼일절 대체공휴일" },
+  ]);
+  const march = calendar(2026, 3, holidays);
+  assert.equal(march[1].isHoliday, true);
+  assert.equal(march[1].holidayName, "삼일절 대체공휴일");
+
+  await assert.rejects(
+    () => fetchOfficialHolidays(2026, 9, async () => new Response(JSON.stringify({ error: "API unavailable" }), { status: 502 })),
+    /Unable to load official holidays: API unavailable/,
+  );
 });
 
 test("education dates are unique mandatory OFF dates with exact quota bonuses", () => {
@@ -86,8 +159,7 @@ test("education dates are unique mandatory OFF dates with exact quota bonuses", 
   assert.equal(monthlyOffTarget(11, normal), 13);
 
   const vacation = parseEmployeeInput({ ...emptyInput(), vacation: "24,25,26,27,28,29", educationDays: "8,22" }, 31);
-  assert.equal(monthlyOffTarget(11, vacation), 15);
-  assert.equal(monthlyOffTarget(11, vacation, true), 16);
+  assert.equal(monthlyOffTarget(11, vacation), 19);
 });
 
 test("education overlap and invalid current-month shift codes are diagnosed", () => {
@@ -95,7 +167,7 @@ test("education overlap and invalid current-month shift codes are diagnosed", ()
     2026,
     8,
     inputs({ 조한승: { wantedOff: "8", vacation: "9", educationDays: "8,9" } }),
-    new Set(),
+    calendar(2026, 8, AUGUST_2026_HOLIDAYS),
   );
   assert.equal(overlap.ok, false);
   if (!overlap.ok) {
@@ -183,7 +255,7 @@ test("cross-month ERP E and N prefixes enforce day-1 boundaries", () => {
     2026,
     8,
     inputs({ 조한승: { requests: "1:D", previousMonthSchedule: previousE } }),
-    new Set(),
+    calendar(2026, 8, AUGUST_2026_HOLIDAYS),
   );
   assert.equal(eBoundary.ok, false);
   if (!eBoundary.ok) assert(eBoundary.failures.some((failure) => failure.includes("Day 1")));
@@ -194,14 +266,14 @@ test("cross-month ERP E and N prefixes enforce day-1 boundaries", () => {
     2026,
     8,
     inputs({ 조한승: { requests: "1:E", previousMonthSchedule: previousN } }),
-    new Set(),
+    calendar(2026, 8, AUGUST_2026_HOLIDAYS),
   );
   assert.equal(nBoundary.ok, false);
   if (!nBoundary.ok) assert(nBoundary.failures.some((failure) => failure.includes("Day 1")));
 });
 
 test("standalone Excel export has one ordered employee row and only D/E/M/N/O codes", async () => {
-  const days = buildDays(2026, 8, new Set());
+  const days = calendar(2026, 8, AUGUST_2026_HOLIDAYS);
   const codes = ["D", "E", "M", "N", "/"] as const;
   const schedule = days.map((_, dayIndex) =>
     Object.fromEntries(
