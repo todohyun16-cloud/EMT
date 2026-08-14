@@ -1,5 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
-import type { DayInfo } from "./types";
+import type { DayInfo } from "./types.js";
 
 export type OfficialHoliday = {
   date: string;

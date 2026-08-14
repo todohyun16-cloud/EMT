@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { parseOfficialHolidayApiXml } from "../src/lib/holidays";
+import { parseOfficialHolidayApiXml } from "../src/lib/holidays.js";
 
 const ENDPOINT = "https://apis.data.go.kr/B090041/openapi/service/SpcdeInfoService/getRestDeInfo";
 
